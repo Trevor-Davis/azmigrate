@@ -842,18 +842,35 @@ def add_fileshare_readiness_slide(prs, m, output_dir: Path):
 
 
 def build_deck(input_dir: Path, output: Path):
+    log(f"Input  : {input_dir}")
+    log(f"Output : {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
+    log("Loading source workbooks...")
     m = load_metrics(input_dir)
+    log("Source data loaded:")
+    log(f"  VMs            : {m['vm_total']:,} ({m['powered_on']:,} on / {m['powered_off']:,} off)")
+    log(f"  Fileshares     : {m['fileshare_total']:,} ({m['fileshare_only_servers']:,} fileshare-only servers / {m['fileshare_only_shares']:,} shares)")
+    log(f"  Databases      : {m['db_total']:,}")
+    log(f"  Web apps       : {m['web_total']:,}")
+    log("Building slides...")
     prs = new_deck()
+    log("  [1/7] Consolidated Infrastructure Summary")
     add_consolidated_slide(prs, m)
+    log("  [2/7] Fileshare Readiness")
     add_fileshare_readiness_slide(prs, m, output.parent)
+    log("  [3/7] VM Power State Summary")
     add_vm_power_slide(prs, m)
+    log("  [4/7] VM Utilization Summary")
     add_vm_utilization_slide(prs, m)
+    log("  [5/7] Fileshares by Host OS Category")
     add_fileshare_os_slide(prs, m)
+    log("  [6/7] Database Resources by Type")
     add_db_slide(prs, m)
+    log("  [7/7] Web Applications by Type")
     add_webapp_slide(prs, m)
+    log("Saving deck...")
     prs.save(output)
-    print(f"Wrote {output}")
+    log(f"Done. Wrote {output}")
 
 
 def main():
