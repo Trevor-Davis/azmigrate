@@ -197,6 +197,118 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
+def _col_letter(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def ensure_recommended_memory(lift_path: Path) -> None:
+    """In Strategy_Lift_and_shift.xlsx, create/refresh:
+       - sheet 'Azure SKUs' with [Azure SKU, Memory (GB)] for every SKU in
+         Server_to_AzureVM!RECOMMENDED_COMPUTE_SKU
+       - column 'Recommended Memory' in Server_to_AzureVM (right after
+         RECOMMENDED_COMPUTE_SKU) populated by VLOOKUP into 'Azure SKUs'
+
+    Uses Excel automation so formulas are evaluated and saved.
+    """
+    try:
+        import win32com.client  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "pywin32 required to update the workbook. Install with: "
+            "python -m pip install pywin32"
+        ) from exc
+
+    log(f"  Updating {lift_path.name}: Azure SKUs sheet + Recommended Memory column")
+    excel = win32com.client.DispatchEx("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    wb = None
+    try:
+        wb = excel.Workbooks.Open(str(lift_path))
+        try:
+            ws = wb.Worksheets("Server_to_AzureVM")
+        except Exception as exc:
+            raise RuntimeError("Server_to_AzureVM sheet not found in lift workbook") from exc
+
+        used = ws.UsedRange
+        last_col = used.Columns.Count
+        last_row = used.Rows.Count
+
+        # Map header -> column index
+        def header_map():
+            m = {}
+            cols = ws.UsedRange.Columns.Count
+            for c in range(1, cols + 1):
+                v = ws.Cells(1, c).Value
+                if v is not None:
+                    m[str(v).strip()] = c
+            return m
+
+        headers = header_map()
+        if "RECOMMENDED_COMPUTE_SKU" not in headers:
+            raise RuntimeError("RECOMMENDED_COMPUTE_SKU column not found")
+
+        # Remove any pre-existing 'Recommended Memory' column (anywhere) so we
+        # always re-insert it cleanly right after RECOMMENDED_COMPUTE_SKU.
+        if "Recommended Memory" in headers:
+            ws.Columns(headers["Recommended Memory"]).Delete()
+            headers = header_map()
+
+        sku_col = headers["RECOMMENDED_COMPUTE_SKU"]
+        sku_letter = _col_letter(sku_col)
+
+        # Collect unique SKUs (skip blanks and 'Unknown')
+        skus = set()
+        for r in range(2, last_row + 1):
+            v = ws.Cells(r, sku_col).Value
+            if v is None:
+                continue
+            text = str(v).strip()
+            if text and text.lower() != "unknown":
+                skus.add(text)
+
+        # (Re)create the 'Azure SKUs' lookup sheet
+        try:
+            wb.Worksheets("Azure SKUs").Delete()
+        except Exception:
+            pass
+        sku_ws = wb.Worksheets.Add(After=ws)
+        sku_ws.Name = "Azure SKUs"
+        sku_ws.Cells(1, 1).Value = "Azure SKU"
+        sku_ws.Cells(1, 2).Value = "Memory (GB)"
+        for i, sku in enumerate(sorted(skus), start=2):
+            sku_ws.Cells(i, 1).Value = sku
+            mem = recommended_memory_gb(sku)
+            if mem is not None:
+                sku_ws.Cells(i, 2).Value = float(mem)
+
+        # Insert 'Recommended Memory' column right after RECOMMENDED_COMPUTE_SKU
+        target_col = sku_col + 1
+        ws.Columns(target_col).Insert()
+        ws.Cells(1, target_col).Value = "Recommended Memory"
+        target_letter = _col_letter(target_col)
+
+        # Fill VLOOKUP formula for all data rows
+        if last_row >= 2:
+            formula = (
+                f"=IFERROR(VLOOKUP({sku_letter}2,'Azure SKUs'!A:B,2,FALSE),\"\")"
+            )
+            rng = ws.Range(f"{target_letter}2:{target_letter}{last_row}")
+            rng.Formula = formula  # Excel auto-fills relative references
+
+        excel.Calculate()
+        wb.Save()
+        log("    Azure SKUs sheet + Recommended Memory column updated")
+    finally:
+        if wb is not None:
+            wb.Close(False)
+        excel.Quit()
+
+
 def read_excel_any(path: Path, sheet: str) -> pd.DataFrame:
     log(f"  - Reading {path.name} [{sheet}]")
     try:
@@ -470,9 +582,9 @@ def load_metrics(input_dir: Path):
             raise FileNotFoundError(path)
 
     discovery = read_excel_any(discovery_path, "Data")
+    ensure_recommended_memory(lift_path)
     lift = read_excel_any(lift_path, "Server_to_AzureVM")
     fs = read_excel_any(paas_path, "FileShares_to_Azure_Files")
-    web = read_excel_any(paas_path, "WebApp_to_AKS")
 
     require_columns(discovery, "Discovery.xlsx/Data", ["resourceType", "parentResourceName"])
     require_columns(
