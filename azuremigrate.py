@@ -193,10 +193,16 @@ def convert_with_excel(path: Path) -> Path:
     return out
 
 
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
 def read_excel_any(path: Path, sheet: str) -> pd.DataFrame:
+    log(f"  - Reading {path.name} [{sheet}]")
     try:
         return read_excel_direct(path, sheet)
     except Exception:
+        log(f"    direct read failed, converting via Excel automation...")
         converted = convert_with_excel(path)
         return pd.read_excel(converted, sheet_name=sheet, engine="openpyxl")
 
