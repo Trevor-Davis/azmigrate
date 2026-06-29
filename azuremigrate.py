@@ -21,10 +21,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
+import io
 import math
 import re
 import shutil
 import tempfile
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
@@ -207,6 +210,46 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
+AZURE_VMS_CSV_URL = "https://raw.githubusercontent.com/Trevor-Davis/azmigrate/refs/heads/main/AzureVMs.csv"
+_GITHUB_SKU_CACHE: dict[str, float] | None = None
+
+
+def fetch_github_sku_map() -> dict[str, float]:
+    """Download and parse the GitHub AzureVMs.csv into {sku: memory_gb}.
+
+    Cached for the life of the process. Returns {} if the fetch fails so the
+    rest of the script can still run with built-in fallbacks.
+    """
+    global _GITHUB_SKU_CACHE
+    if _GITHUB_SKU_CACHE is not None:
+        return _GITHUB_SKU_CACHE
+    log(f"  Fetching SKU lookup from GitHub: {AZURE_VMS_CSV_URL}")
+    mapping: dict[str, float] = {}
+    try:
+        req = urllib.request.Request(AZURE_VMS_CSV_URL, headers={"User-Agent": "azmigrate-script"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(raw))
+        if not reader.fieldnames or "Name" not in reader.fieldnames or "MemoryGB" not in reader.fieldnames:
+            log(f"    WARNING: CSV missing expected 'Name'/'MemoryGB' columns; got {reader.fieldnames}")
+            _GITHUB_SKU_CACHE = {}
+            return _GITHUB_SKU_CACHE
+        for row in reader:
+            name = (row.get("Name") or "").strip()
+            mem = (row.get("MemoryGB") or "").strip()
+            if not name or not mem:
+                continue
+            try:
+                mapping[name] = float(mem)
+            except ValueError:
+                continue
+        log(f"    Loaded {len(mapping):,} SKU entries from GitHub")
+    except Exception as exc:
+        log(f"    WARNING: Could not fetch GitHub SKU list ({exc}); falling back to built-in lookup only")
+    _GITHUB_SKU_CACHE = mapping
+    return _GITHUB_SKU_CACHE
+
+
 def _col_letter(n: int) -> str:
     s = ""
     while n > 0:
@@ -313,6 +356,7 @@ def ensure_recommended_memory(lift_path: Path) -> None:
                 pass
 
         # (Re)create the 'Azure SKUs' lookup sheet, preserving user-entered values
+        github_map = fetch_github_sku_map()
         sku_ws = wb.Worksheets.Add(After=ws)
         sku_ws.Name = "Azure SKUs"
         sku_ws.Cells(1, 1).Value = "Azure SKU"
@@ -322,6 +366,9 @@ def ensure_recommended_memory(lift_path: Path) -> None:
             sku_ws.Cells(i, 1).Value = sku
             if sku in existing_memory:
                 sku_ws.Cells(i, 2).Value = existing_memory[sku]
+                continue
+            if sku in github_map:
+                sku_ws.Cells(i, 2).Value = float(github_map[sku])
                 continue
             mem = recommended_memory_gb(sku)
             if mem is not None:
@@ -692,6 +739,10 @@ def load_metrics(input_dir: Path):
     }
     db_total = sum(db_counts.values())
 
+    sql_rows = discovery[discovery["resourceType"].eq("microsoft.offazure/mastersites/sqlsites/sqlservers")]
+    sql_instance_count = int(len(sql_rows))
+    sql_server_count = int(sql_rows["parentResourceName"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique())
+
     web_counts = {
         "IIS Web Applications": int(discovery["resourceType"].eq("microsoft.offazure/mastersites/webappsites/iiswebapplications").sum()),
         "Tomcat Web Applications": int(discovery["resourceType"].eq("microsoft.offazure/mastersites/webappsites/tomcatwebapplications").sum()),
@@ -749,6 +800,8 @@ def load_metrics(input_dir: Path):
         "db_total": db_total,
         "web_counts": web_counts,
         "web_total": web_total,
+        "sql_instance_count": sql_instance_count,
+        "sql_server_count": sql_server_count,
         "onprem_storage_gb": onprem_storage_gb,
         "rec_storage_gb": rec_storage_gb,
         "onprem_cores": onprem_cores,
@@ -844,6 +897,41 @@ def add_vm_utilization_slide(prs, m):
     add_card(slide, 2.85, 4.25, card_w, card_h, pb_from_gb(m["rec_storage_gb"]), "Storage", f"{storage_delta:+.1f}% vs on-prem", TEAL, 26)
     add_card(slide, 5.15, 4.25, card_w, card_h, f"{m['rec_cores']:,.0f}", "Cores", f"{cores_delta:+.1f}% vs on-prem", MINT, 26)
     add_card(slide, 7.45, 4.25, card_w, card_h, tb_from_gib(m["rec_mem_gb"]), "Memory", f"{mem_delta:+.1f}% vs on-prem", MINT, 26)
+
+    # Comparison bar chart: on-prem vs recommended Azure sizing, per metric.
+    panel_x, panel_y, panel_w, panel_h = 9.75, 1.55, 3.4, 4.25
+    add_panel(slide, panel_x, panel_y, panel_w, panel_h, "On-prem vs Azure", title_size=13)
+    legend_y = panel_y + 0.55
+    sw_x = panel_x + 0.2
+    sw = 0.18
+    s1 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(sw_x), Inches(legend_y), Inches(sw), Inches(0.12))
+    s1.fill.solid(); s1.fill.fore_color.rgb = TEAL; s1.line.fill.background()
+    add_text(slide, "On-prem", sw_x + sw + 0.05, legend_y - 0.04, 0.8, 0.2, 9, SLATE)
+    s2 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(sw_x + 1.25), Inches(legend_y), Inches(sw), Inches(0.12))
+    s2.fill.solid(); s2.fill.fore_color.rgb = MINT; s2.line.fill.background()
+    add_text(slide, "Azure", sw_x + 1.25 + sw + 0.05, legend_y - 0.04, 0.8, 0.2, 9, SLATE)
+
+    metrics = [
+        ("Storage", pb_from_gb(m["onprem_storage_gb"]), pb_from_gb(m["rec_storage_gb"]), m["onprem_storage_gb"], m["rec_storage_gb"]),
+        ("Cores",   f"{m['onprem_cores']:,.0f}",        f"{m['rec_cores']:,.0f}",        m["onprem_cores"],     m["rec_cores"]),
+        ("Memory",  tb_from_gib(m["onprem_mem_gb"]),    tb_from_gib(m["rec_mem_gb"]),    m["onprem_mem_gb"],    m["rec_mem_gb"]),
+    ]
+    bars_x = panel_x + 0.2
+    bars_w = 1.8
+    label_w = panel_w - 0.4 - bars_w - 0.05
+    group_top = panel_y + 1.05
+    group_h = (panel_h - 1.2) / len(metrics)
+    for i, (label, on_text, az_text, on_val, az_val) in enumerate(metrics):
+        gy = group_top + i * group_h
+        add_text(slide, label, bars_x, gy, panel_w - 0.4, 0.22, 11, NAVY, True)
+        bar_max = max(on_val, az_val, 1)
+        b1y = gy + 0.32
+        b2y = b1y + 0.34
+        add_bar(slide, bars_x, b1y, bars_w, 0.22, on_val, bar_max, TEAL)
+        add_text(slide, on_text, bars_x + bars_w + 0.05, b1y - 0.03, label_w, 0.25, 9, NAVY, True)
+        add_bar(slide, bars_x, b2y, bars_w, 0.22, az_val, bar_max, MINT)
+        add_text(slide, az_text, bars_x + bars_w + 0.05, b2y - 0.03, label_w, 0.25, 9, NAVY, True)
+
     add_source(
         slide,
         "Source: Strategy_Lift_and_shift.xlsx, Server_to_AzureVM tab. Recommended storage, cores, and memory are compared to on-premises totals.",
@@ -857,19 +945,21 @@ def add_fileshare_os_slide(prs, m):
     windows = m["os_counts"].get("Windows", 0)
     rhel = m["os_counts"].get("RHEL", 0)
     other = m["os_counts"].get("Other/Unknown", 0)
-    add_card(slide, 0.85, 1.35, 2.35, 1.25, f"{m['fileshare_total']:,}", "Total fileshares", "", TEAL, value_size=32, label_size=11)
-    add_card(slide, 3.95, 1.35, 2.35, 1.25, f"{windows:,}", "Windows-hosted", "", TEAL, value_size=32, label_size=11)
-    add_card(slide, 6.95, 1.35, 2.35, 1.25, f"{rhel + other:,}", "Linux / RHEL-hosted", "", MINT, value_size=32, label_size=11)
-    add_text(slide, "Fileshare distribution", 9.55, 2.1, 2.35, 0.19, 11, SLATE, True, align=PP_ALIGN.CENTER)
+    breakdown = [("Windows", windows), ("Linux / RHEL", rhel), ("Other / Unknown", other)]
+    add_card(slide, 0.85, 1.25, 2.35, 1.35, f"{m['fileshare_total']:,}", "Total fileshares", "", TEAL, value_size=34, label_size=11)
+    max_count = max((c for _, c in breakdown), default=0) or 1
+    for i, (label, count) in enumerate(breakdown):
+        y = 1.52 + i * 0.32
+        add_text(slide, label, 3.35, y, 1.4, 0.18, 10, SLATE)
+        add_bar(slide, 4.85, y + 0.03, 6.80, 0.15, count, max_count, TEAL)
+        add_text(slide, f"{count:,}", 11.80, y, 0.5, 0.18, 10, NAVY, True, align=PP_ALIGN.RIGHT)
     rows = [["Host OS type", "OS category", "Fileshares", "Share"]]
     for label, count in [("Windows", windows), ("Linux", rhel), ("Other/Unknown", other)]:
         if count:
             rows.append([label, "RHEL" if label == "Linux" else label, f"{count:,}", pct(count, m["fileshare_total"])])
     rows.append(["Total", "", f"{m['fileshare_total']:,}", "100.0%"])
-    add_panel(slide, 0.75, 3.2, 7.7, 2.2, "Fileshare count by host operating system", title_size=17)
-    add_table(slide, rows, 0.95, 3.88, 7.2, 1.48, 12, col_widths=[2.0, 1.8, 1.6, 1.3])
-    add_text(slide, pct(windows, m["fileshare_total"]), 9.08, 4.12, 2.25, 0.5, 30, NAVY, True, align=PP_ALIGN.CENTER)
-    add_text(slide, "of discovered fileshares are hosted by Windows machines.", 9.0, 4.75, 2.35, 0.4, 12, SLATE, align=PP_ALIGN.CENTER)
+    add_panel(slide, 1.8, 3.25, 9.2, 2.6, "Fileshare count by host operating system", title_size=17)
+    add_table(slide, rows, 2.0, 3.92, 8.8, 1.8, 12, col_widths=[2.5, 2.3, 2.0, 2.0])
     add_source(
         slide,
         "Source: Discovery.xlsx, Data sheet. Fileshares are resourceType = microsoft.applicationmigration/storagesites/fileshares; OS is joined from host machine records.",
@@ -900,15 +990,18 @@ def add_webapp_slide(prs, m):
     slide = blank_slide(prs)
     slide_title(slide, "Web Applications by Type", "Counted by webapp rows")
     add_card(slide, 0.85, 1.25, 2.35, 1.35, f"{m['web_total']:,}", "Total webapps", "", TEAL, value_size=34, label_size=11)
-    add_card(slide, 3.95, 1.25, 2.35, 1.35, f"{m['web_counts'].get('IIS Web Applications', 0):,}", "IIS webapps", "", TEAL, value_size=34, label_size=11)
-    add_card(slide, 6.95, 1.25, 2.35, 1.35, f"{m['web_counts'].get('Tomcat Web Applications', 0):,}", "Tomcat webapps", "", MINT, value_size=34, label_size=11)
-    add_text(slide, "Webapp row distribution", 9.55, 2.1, 2.35, 0.19, 11, SLATE, True, align=PP_ALIGN.CENTER)
+    max_count = max(m["web_counts"].values()) or 1
+    for i, (label, count) in enumerate(m["web_counts"].items()):
+        y = 1.52 + i * 0.28
+        add_text(slide, label, 3.35, y, 1.7, 0.18, 10, SLATE)
+        add_bar(slide, 5.15, y + 0.03, 6.50, 0.15, count, max_count, TEAL)
+        add_text(slide, f"{count:,}", 11.80, y, 0.5, 0.18, 10, NAVY, True, align=PP_ALIGN.RIGHT)
     rows = [["Webapp type", "Webapp rows", "Share"]]
     for k, v in m["web_counts"].items():
         rows.append([k, f"{v:,}", pct(v, m["web_total"])])
     rows.append(["Total", f"{m['web_total']:,}", "100.0%"])
-    add_panel(slide, 1.8, 3.25, 9.2, 2.0, "Webapp count by type", title_size=17)
-    add_table(slide, rows, 2.0, 3.96, 8.8, 1.22, 12, col_widths=[4.6, 2.0, 2.0])
+    add_panel(slide, 1.8, 3.25, 9.2, 2.6, "Webapp count by type", title_size=17)
+    add_table(slide, rows, 2.0, 3.92, 8.8, 1.8, 12, col_widths=[4.6, 2.0, 2.0])
     add_source(
         slide,
         "Source: Discovery.xlsx, Data sheet. Webapp rows identified from resourceType; duplicate parentResourceName values are counted separately.",
@@ -984,7 +1077,9 @@ def add_fileshare_readiness_slide(prs, m, output_dir: Path):
     add_small_card(slide, 6.17, 2.10, 1.42, 1.02, f"{m['fileshare_only_size_tb']:.1f} TB", "Azure Files size", TEAL, value_size=15, label_size=8)
     add_small_card(slide, 7.70, 2.10, 1.42, 1.02, money_k(m["fileshare_only_azure_cost"]), "Azure Files / mo", GREEN, value_size=15, label_size=8)
     add_small_card(slide, 9.23, 2.10, 1.42, 1.02, money_k(m["fileshare_only_lift_cost"]), "Lift & shift / mo", RED, value_size=15, label_size=8)
-    add_small_card(slide, 10.75, 2.10, 1.34, 1.02, money_k(m["fileshare_only_lift_cost"] - m["fileshare_only_azure_cost"]), "Monthly delta", GREEN, value_size=15, label_size=8)
+    delta_value = m["fileshare_only_lift_cost"] - m["fileshare_only_azure_cost"]
+    delta_color = GREEN if delta_value >= 0 else RED
+    add_small_card(slide, 10.75, 2.10, 1.34, 1.02, money_k(delta_value), "Monthly delta", delta_color, value_size=15, label_size=8)
 
     add_panel(slide, 6.05, 3.25, 6.3, 3.15, "Azure Files readiness distribution", title_size=16)
     readiness = create_readiness_image(output_dir / "azure-files-readiness-distribution.png", m["readiness_counts"])
@@ -1001,6 +1096,42 @@ def add_fileshare_readiness_slide(prs, m, output_dir: Path):
     )
 
 
+def add_sql_readiness_slide(prs, m):
+    slide = blank_slide(prs)
+    slide_title(slide, "SQL Readiness")
+    add_card(slide, 0.85, 1.25, 2.55, 1.55, f"{m['sql_instance_count']:,}", "SQL Server Instances", "", TEAL, value_size=40, label_size=12)
+    add_card(slide, 3.65, 1.25, 2.55, 1.55, f"{m['sql_server_count']:,}", "Servers running SQL", "", MINT, value_size=40, label_size=12)
+
+    instances_per_server = m["sql_instance_count"] / m["sql_server_count"] if m["sql_server_count"] else 0
+    add_panel(slide, 6.45, 1.25, 6.0, 1.55, "Density", title_size=14)
+    add_text(slide, f"{instances_per_server:.1f}", 6.65, 1.75, 2.0, 0.7, 40, NAVY, True)
+    add_text(slide, "Average SQL Server instances per host", 8.8, 1.95, 3.5, 0.6, 11, SLATE, True)
+
+    rows = [
+        ["Metric", "Count"],
+        ["SQL Server Instances", f"{m['sql_instance_count']:,}"],
+        ["Unique servers running SQL", f"{m['sql_server_count']:,}"],
+    ]
+    add_panel(slide, 1.8, 3.25, 9.2, 2.6, "SQL Server inventory", title_size=17)
+    add_table(slide, rows, 2.0, 3.92, 8.8, 1.8, 12, col_widths=[5.6, 3.2])
+    add_source(
+        slide,
+        "Source: Discovery.xlsx, Data sheet. SQL Server Instances = rows where resourceType = microsoft.offazure/mastersites/sqlsites/sqlservers. "
+        "Servers running SQL = distinct parentResourceName values for those same rows.",
+        size=8,
+    )
+    slide = blank_slide(prs)
+    slide.background.fill.solid()
+    slide.background.fill.fore_color.rgb = NAVY
+
+    # Accent stripe
+    stripe = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(5.05), Inches(SLIDE_W), Inches(0.10))
+    stripe.fill.solid(); stripe.fill.fore_color.rgb = TEAL; stripe.line.fill.background()
+
+    add_text(slide, "Azure Migrate Interpreted", 0.6, 2.6, SLIDE_W - 1.2, 1.3, 60, WHITE, True, font="Aptos Display", align=PP_ALIGN.CENTER)
+    add_text(slide, "Discovery and assessment summary", 0.6, 4.05, SLIDE_W - 1.2, 0.5, 20, RGBColor(202, 220, 252), False, align=PP_ALIGN.CENTER)
+
+
 def build_deck(input_dir: Path, output: Path):
     log(f"Input  : {input_dir}")
     log(f"Output : {output}")
@@ -1014,19 +1145,23 @@ def build_deck(input_dir: Path, output: Path):
     log(f"  Web apps       : {m['web_total']:,}")
     log("Building slides...")
     prs = new_deck()
-    log("  [1/7] Consolidated Infrastructure Summary")
+    log("  [1/9] Title")
+    add_title_slide(prs)
+    log("  [2/9] Consolidated Infrastructure Summary")
     add_consolidated_slide(prs, m)
-    log("  [2/7] Fileshare Readiness")
+    log("  [3/9] Fileshare Readiness")
     add_fileshare_readiness_slide(prs, m, output.parent)
-    log("  [3/7] VM Power State Summary")
+    log("  [4/9] VM Power State Summary")
     add_vm_power_slide(prs, m)
-    log("  [4/7] VM Utilization Summary")
+    log("  [5/9] VM Utilization Summary")
     add_vm_utilization_slide(prs, m)
-    log("  [5/7] Fileshares by Host OS Category")
+    log("  [6/9] Fileshares by Host OS Category")
     add_fileshare_os_slide(prs, m)
-    log("  [6/7] Database Resources by Type")
+    log("  [7/9] Database Resources by Type")
     add_db_slide(prs, m)
-    log("  [7/7] Web Applications by Type")
+    log("  [8/9] SQL Readiness")
+    add_sql_readiness_slide(prs, m)
+    log("  [9/9] Web Applications by Type")
     add_webapp_slide(prs, m)
     log("Saving deck...")
     prs.save(output)
