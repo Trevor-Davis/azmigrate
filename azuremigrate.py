@@ -122,9 +122,19 @@ def recommended_memory_gb(sku) -> float | None:
         return None
     if text in SKU_MEMORY_GB:
         return float(SKU_MEMORY_GB[text])
-    match = re.match(r"^Standard_([DE])(\d+)[A-Za-z0-9_]*$", text)
+    match = re.match(r"^Standard_([DEFL])(\d+)[A-Za-z0-9_]*$", text)
     if match:
-        return float(int(match.group(2)) * (4 if match.group(1) == "D" else 8))
+        family = match.group(1)
+        n = int(match.group(2))
+        multiplier = {"D": 4, "E": 8, "F": 2, "L": 8}[family]
+        return float(n * multiplier)
+    match = re.match(r"^Standard_B(\d+)(m?s)?$", text)
+    if match:
+        n = int(match.group(1))
+        suffix = (match.group(2) or "").lower()
+        if suffix == "ms":
+            return float(n * 4)
+        return float(n * 2)
     match = re.match(r"^Standard_M(\d+)[A-Za-z0-9_]*$", text)
     if match:
         return float(int(match.group(1)) * 8)
@@ -271,20 +281,53 @@ def ensure_recommended_memory(lift_path: Path) -> None:
             if text and text.lower() != "unknown":
                 skus.add(text)
 
-        # (Re)create the 'Azure SKUs' lookup sheet
+        # Preserve any user-supplied memory values already present in the
+        # existing Azure SKUs sheet — the workbook is the source of truth.
+        existing_memory: dict[str, float] = {}
         try:
-            wb.Worksheets("Azure SKUs").Delete()
+            existing_ws = wb.Worksheets("Azure SKUs")
         except Exception:
-            pass
+            existing_ws = None
+        if existing_ws is not None:
+            try:
+                ex_used = existing_ws.UsedRange
+                ex_rows = ex_used.Rows.Count
+                for r in range(2, ex_rows + 1):
+                    sku_val = existing_ws.Cells(r, 1).Value
+                    mem_val = existing_ws.Cells(r, 2).Value
+                    if sku_val is None:
+                        continue
+                    key = str(sku_val).strip()
+                    if not key:
+                        continue
+                    try:
+                        if mem_val is not None and str(mem_val).strip() != "":
+                            existing_memory[key] = float(mem_val)
+                    except (TypeError, ValueError):
+                        pass
+            except Exception:
+                pass
+            try:
+                existing_ws.Delete()
+            except Exception:
+                pass
+
+        # (Re)create the 'Azure SKUs' lookup sheet, preserving user-entered values
         sku_ws = wb.Worksheets.Add(After=ws)
         sku_ws.Name = "Azure SKUs"
         sku_ws.Cells(1, 1).Value = "Azure SKU"
         sku_ws.Cells(1, 2).Value = "Memory (GB)"
+        blanks: list[str] = []
         for i, sku in enumerate(sorted(skus), start=2):
             sku_ws.Cells(i, 1).Value = sku
+            if sku in existing_memory:
+                sku_ws.Cells(i, 2).Value = existing_memory[sku]
+                continue
             mem = recommended_memory_gb(sku)
             if mem is not None:
                 sku_ws.Cells(i, 2).Value = float(mem)
+            else:
+                blanks.append(sku)
 
         # Insert 'Recommended Memory' column right after RECOMMENDED_COMPUTE_SKU
         target_col = sku_col + 1
@@ -303,6 +346,11 @@ def ensure_recommended_memory(lift_path: Path) -> None:
         excel.Calculate()
         wb.Save()
         log("    Azure SKUs sheet + Recommended Memory column updated")
+        if blanks:
+            log(f"    WARNING: {len(blanks)} SKU(s) have no memory value yet — fill them in the 'Azure SKUs' sheet:")
+            for s in blanks:
+                log(f"      - {s}")
+            log("    These rows will show as 0 in totals until you fill the values. Re-run the script after editing.")
     finally:
         if wb is not None:
             wb.Close(False)
@@ -751,7 +799,7 @@ def add_bar(slide, x, y, w, h, value, max_value, color):
 
 def add_vm_power_slide(prs, m):
     slide = blank_slide(prs)
-    slide_title(slide, "VM Power State Summary", "Kettering Full AZ Migrate discovery data")
+    slide_title(slide, "VM Power State Summary")
 
     max_count = max(m["powered_on"], m["powered_off"], 1)
     chart_x, chart_y, chart_w, chart_h = 1.25, 1.55, 10.9, 1.2
@@ -805,7 +853,7 @@ def add_vm_utilization_slide(prs, m):
 
 def add_fileshare_os_slide(prs, m):
     slide = blank_slide(prs)
-    slide_title(slide, "Fileshares by Host OS Category", "Kettering Full AZ Migrate discovery data")
+    slide_title(slide, "Fileshares by Host OS Category")
     windows = m["os_counts"].get("Windows", 0)
     rhel = m["os_counts"].get("RHEL", 0)
     other = m["os_counts"].get("Other/Unknown", 0)
@@ -831,7 +879,7 @@ def add_fileshare_os_slide(prs, m):
 
 def add_db_slide(prs, m):
     slide = blank_slide(prs)
-    slide_title(slide, "Database Resources by Type", "Kettering Full AZ Migrate discovery data")
+    slide_title(slide, "Database Resources by Type")
     add_card(slide, 0.85, 1.25, 2.35, 1.35, f"{m['db_total']:,}", "Total database resources", "", TEAL, value_size=34, label_size=11)
     max_count = max(m["db_counts"].values()) or 1
     for i, (label, count) in enumerate(m["db_counts"].items()):
@@ -870,7 +918,7 @@ def add_webapp_slide(prs, m):
 
 def add_consolidated_slide(prs, m):
     slide = blank_slide(prs)
-    slide_title(slide, "Consolidated Infrastructure Summary", "Kettering Full AZ Migrate discovery and lift-and-shift assessment snapshot")
+    slide_title(slide, "Consolidated Infrastructure Summary")
     add_panel(slide, 0.4, 1.1, 2.6, 2.0, "VM Power State Chart", title_size=14)
     max_count = max(m["powered_on"], m["powered_off"], 1)
     for i, (label, count, color) in enumerate([("Powered On", m["powered_on"], TEAL), ("Powered Off", m["powered_off"], PINK)]):
@@ -905,21 +953,21 @@ def add_consolidated_slide(prs, m):
     if other:
         fs_rows.append(["Other", "Unknown", f"{other:,}", pct(other, m["fileshare_total"])])
     fs_rows.append(["Total", "", f"{m['fileshare_total']:,}", "100.0%"])
-    add_table(slide, fs_rows, 0.56, 3.94, 3.69, 1.11, 11, col_widths=[1.15, 1.0, 0.85, 0.65])
+    add_table(slide, fs_rows, 0.55, 4.05, 3.6, 1.6, 11, col_widths=[1.1, 1.0, 0.85, 0.65])
 
     add_panel(slide, 4.55, 3.45, 3.75, 2.4, "Database count by type", title_size=14)
     db_rows = [["Database type", "Count", "Share"]]
     for k, v in m["db_counts"].items():
         db_rows.append([k, f"{v:,}", pct(v, m["db_total"])])
     db_rows.append(["Total", f"{m['db_total']:,}", "100.0%"])
-    add_table(slide, db_rows, 4.82, 3.94, 3.69, 1.5, 11, col_widths=[1.85, 0.9, 0.8])
+    add_table(slide, db_rows, 4.7, 4.05, 3.45, 1.7, 11, col_widths=[1.85, 0.85, 0.75])
 
     add_panel(slide, 8.7, 3.45, 3.85, 2.4, "Webapp count by type", title_size=14)
     web_rows = [["Webapp type", "Webapp", "Share"]]
     for k, v in m["web_counts"].items():
         web_rows.append([k, f"{v:,}", pct(v, m["web_total"])])
     web_rows.append(["Total", f"{m['web_total']:,}", "100.0%"])
-    add_table(slide, web_rows, 9.08, 3.94, 3.69, 1.11, 11, col_widths=[1.85, 0.95, 0.75])
+    add_table(slide, web_rows, 8.85, 4.05, 3.55, 1.6, 11, col_widths=[1.95, 0.85, 0.75])
 
 
 def add_fileshare_readiness_slide(prs, m, output_dir: Path):
