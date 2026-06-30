@@ -1488,9 +1488,32 @@ def add_webapp_readiness_slide(prs, m, output_dir: Path):
                 text_color = WHITE if row_label == "Total" and col not in {"Extended", "Ready With Conditions"} else NAVY
                 add_text(slide, f"{values.get(col, 0):,}", x + 0.04, y + 0.08, cell_w - col_gap - 0.08, 0.17, 9, text_color, True, align=PP_ALIGN.CENTER)
 
+    add_panel(slide, 0.55, 4.02, 5.95, 2.52, "directSupportStatus by type", title_size=13)
     support_rows = {web_type: webapp_by_type[web_type]["support_counts"] for web_type in web_types}
     support_rows["Total"] = webapp_by_type["Total"]["support_counts"]
-    draw_stacked_matrix(0.55, 4.02, 5.95, "directSupportStatus by type", support_order, support_rows, support_colors)
+    support_max = max([sum(support_rows[row].get(status, 0) for status in support_order) for row in [*web_types, "Total"]] + [1])
+    bar_x, bar_w = 2.00, 3.45
+    row_y = 4.92
+    for i, row_label in enumerate([*web_types, "Total"]):
+        y = row_y + i * 0.42
+        add_text(slide, row_label, 0.82, y + 0.03, 0.85, 0.18, 9, NAVY, True)
+        x = bar_x
+        for status in support_order:
+            value = support_rows[row_label].get(status, 0)
+            seg_w = max(0.01, bar_w * safe_div(value, support_max))
+            color = support_colors.get(status, TEAL) if row_label == "Total" else lighter(support_colors.get(status, TEAL))
+            seg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y + 0.04), Inches(seg_w), Inches(0.18))
+            seg.fill.solid(); seg.fill.fore_color.rgb = color; seg.line.fill.background()
+            if value:
+                text_color = WHITE if row_label == "Total" and status != "Extended" else NAVY
+                add_text(slide, f"{value:,}", x + 0.03, y + 0.045, max(0.22, seg_w - 0.06), 0.14, 7, text_color, True, align=PP_ALIGN.CENTER)
+            x += seg_w
+    legend_y = 4.50
+    for i, status in enumerate(support_order):
+        x = 0.85 + i * 1.25
+        sw = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(legend_y), Inches(0.12), Inches(0.10))
+        sw.fill.solid(); sw.fill.fore_color.rgb = support_colors.get(status, TEAL); sw.line.fill.background()
+        add_text(slide, status_label(status), x + 0.17, legend_y - 0.04, 1.00, 0.16, 7, SLATE, True)
 
     readiness_rows = {web_type: readiness_by_type.get(web_type, {}) for web_type in web_types}
     readiness_rows["Total"] = readiness_total
@@ -1503,22 +1526,32 @@ def add_webapp_readiness_slide(prs, m, output_dir: Path):
     )
 
 
-def add_webapp_slide(prs, m):
+def add_webapp_slide(prs, m, output_dir: Path):
     slide = blank_slide(prs)
     slide_title(slide, "Web Applications by Type", "Counted by webapp rows")
-    add_card(slide, 0.85, 1.25, 2.35, 1.35, f"{m['web_total']:,}", "Total webapps", "", TEAL, value_size=34, label_size=11)
-    max_count = max(m["web_counts"].values()) or 1
-    for i, (label, count) in enumerate(m["web_counts"].items()):
-        y = 1.52 + i * 0.28
-        add_text(slide, label, 3.35, y, 1.7, 0.18, 10, SLATE)
-        add_bar(slide, 5.15, y + 0.03, 6.50, 0.15, count, max_count, TEAL)
-        add_text(slide, f"{count:,}", 11.80, y, 0.5, 0.18, 10, NAVY, True, align=PP_ALIGN.RIGHT)
-    rows = [["Webapp type", "Webapp rows", "Share"]]
-    for k, v in m["web_counts"].items():
-        rows.append([k, f"{v:,}", pct(v, m["web_total"])])
-    rows.append(["Total", f"{m['web_total']:,}", "100.0%"])
-    add_panel(slide, 1.8, 3.25, 9.2, 2.6, "Webapp count by type", title_size=17)
-    add_table(slide, rows, 2.0, 3.92, 8.8, 1.8, 12, col_widths=[4.6, 2.0, 2.0])
+    add_panel(slide, 2.35, 1.25, 8.60, 4.95, "Webapp type distribution", title_size=17)
+    pie_values = {
+        "IIS": int(m["webapp_by_type"]["IIS"]["webapps"]),
+        "Tomcat": int(m["webapp_by_type"]["Tomcat"]["webapps"]),
+    }
+    pie_path = create_pie_image(output_dir / "webapp-type-distribution-large.png", "WebApp Types", pie_values, {"IIS": TEAL, "Tomcat": ORANGE})
+    slide.shapes.add_picture(str(pie_path), Inches(2.70), Inches(1.80), Inches(5.45), Inches(3.35))
+    summary_rows = [
+        ["Metric", "Count"],
+        ["Webapp rows", f"{m['webapp_by_type']['Total']['webapps']:,}"],
+        ["Unique servers", f"{m['webapp_by_type']['Total']['servers']:,}"],
+    ]
+    add_table(slide, summary_rows, 8.25, 2.35, 2.35, 1.20, 12, col_widths=[1.45, 0.90])
+    add_text(
+        slide,
+        "Server count deduplicates parentResourceName across all webapp resourceType rows.",
+        8.25,
+        3.75,
+        2.25,
+        0.45,
+        9,
+        MUTED,
+    )
     add_source(
         slide,
         "Source: Discovery.xlsx, Data sheet. Webapp rows identified from resourceType; duplicate parentResourceName values are counted separately.",
@@ -1904,7 +1937,7 @@ def build_deck(input_dir: Path, output: Path):
     log("  [10/11] WebApp Readiness")
     add_webapp_readiness_slide(prs, m, output.parent)
     log("  [11/11] Web Applications by Type")
-    add_webapp_slide(prs, m)
+    add_webapp_slide(prs, m, output.parent)
     log("Saving deck...")
     # Write to a local temp file first, validate, then move to the final path.
     # This prevents PowerPoint/OneDrive from seeing a partially-written file
