@@ -51,6 +51,8 @@ MINT = RGBColor(2, 195, 154)
 GREEN = RGBColor(34, 139, 34)
 RED = RGBColor(220, 38, 38)
 ORANGE = RGBColor(255, 128, 0)
+YELLOW = RGBColor(234, 179, 8)
+GREY = RGBColor(148, 163, 184)
 WHITE = RGBColor(255, 255, 255)
 BG = RGBColor(248, 250, 252)
 LINE = RGBColor(218, 226, 238)
@@ -146,6 +148,11 @@ def recommended_memory_gb(sku) -> float | None:
 
 def money_k(value: float) -> str:
     return f"${value / 1000:.1f}K"
+
+
+def money_full(value: float) -> str:
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.0f}"
 
 
 def tb_from_gb(value: float) -> str:
@@ -681,6 +688,19 @@ def load_metrics(input_dir: Path):
     lift = read_excel_any(lift_path, "Server_to_AzureVM")
     fs = read_excel_any(paas_path, "FileShares_to_Azure_Files")
 
+    def _read_optional(path: Path, sheet: str):
+        try:
+            return read_excel_any(path, sheet)
+        except Exception as exc:
+            log(f"    Optional sheet '{sheet}' not loaded ({exc}); continuing")
+            return None
+
+    sql_vm_df = _read_optional(paas_path, "SQLinstance_to_AzureSQLVM")
+    sql_mi_df = _read_optional(paas_path, "SQLinstance_to_AzureSQLMI")
+    mongo_df = _read_optional(paas_path, "Mongo_to_Azure_Document_DB")
+    mysql_df = _read_optional(paas_path, "MySQL_to_AzureFlexServerMySQL")
+    pgsql_df = _read_optional(paas_path, "PgSQL_to_AzureFlexServerPG")
+
     require_columns(discovery, "Discovery.xlsx/Data", ["resourceType", "parentResourceName"])
     require_columns(
         lift,
@@ -743,6 +763,102 @@ def load_metrics(input_dir: Path):
     sql_instance_count = int(len(sql_rows))
     sql_server_count = int(sql_rows["parentResourceName"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique())
 
+    # SQL version breakdown: count per (version, pssStatus). pssStatus drives bar color.
+    if {"version", "pssStatus"}.issubset(sql_rows.columns):
+        sql_version_df = sql_rows.assign(
+            version=sql_rows["version"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown"),
+            pssStatus=sql_rows["pssStatus"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown"),
+        )
+        grouped = sql_version_df.groupby(["version", "pssStatus"]).size().reset_index(name="count")
+        sql_versions = [
+            (row["version"], row["pssStatus"], int(row["count"]))
+            for _, row in grouped.sort_values("count", ascending=False).iterrows()
+        ]
+    else:
+        sql_versions = []
+
+    READINESS_ORDER = ["Ready", "Not Ready", "Ready With Conditions", "Unknown"]
+
+    def _readiness_counts(df, col):
+        result = {k: 0 for k in READINESS_ORDER}
+        if df is None or col not in df.columns:
+            return result, 0
+        vals = (
+            df[col]
+            .fillna("Unknown")
+            .astype(str)
+            .str.strip()
+            .replace("", "Unknown")
+        )
+        # Case-insensitive bucket lookup so "Ready with Conditions" matches "Ready With Conditions"
+        bucket_by_lower = {k.lower(): k for k in READINESS_ORDER}
+        for v in vals:
+            key = bucket_by_lower.get(v.lower(), "Unknown")
+            result[key] += 1
+        return result, int(vals.shape[0])
+
+    sql_vm_readiness, sql_vm_total = _readiness_counts(sql_vm_df, "AZURE_SQL_VM_READINESS")
+    sql_mi_readiness, sql_mi_total = _readiness_counts(sql_mi_df, "AZURE_SQL_MI_READINESS")
+    non_sql_db_specs = [
+        ("MongoDB", mongo_df, "AZURE DOCUMENTDB READINESS"),
+        ("MySQL", mysql_df, "AZURE DB FOR MYSQL READINESS"),
+        ("PostgreSQL", pgsql_df, "AZURE DB FOR POSTGRESQL READINESS"),
+    ]
+    non_sql_db_counts: dict[str, int] = {}
+    non_sql_db_readiness: dict[str, dict[str, int]] = {}
+    non_sql_db_total = 0
+    non_sql_db_readiness_total = {k: 0 for k in READINESS_ORDER}
+    for db_type, df, readiness_col in non_sql_db_specs:
+        counts, total = _readiness_counts(df, readiness_col)
+        non_sql_db_counts[db_type] = total
+        non_sql_db_readiness[db_type] = counts
+        non_sql_db_total += total
+        for key, value in counts.items():
+            non_sql_db_readiness_total[key] += value
+
+    # SQL cost comparison: lift-and-shift everything vs. SQL MI where ready + lift-and-shift the rest.
+    def _sum_cost(df, cols):
+        if df is None:
+            return 0.0
+        total = 0.0
+        for c in cols:
+            if c in df.columns:
+                total += float(pd.to_numeric(df[c], errors="coerce").fillna(0).sum())
+        return total
+
+    sql_servers_norm: set[str] = set()
+    for df, col in [(sql_mi_df, "Server"), (sql_vm_df, "SERVER")]:
+        if df is None:
+            continue
+        candidate_col = col if col in df.columns else next(
+            (c for c in df.columns if c.lower() == col.lower()), None
+        )
+        if candidate_col is None:
+            continue
+        for v in df[candidate_col].dropna().astype(str):
+            n = norm_server(v)
+            if n:
+                sql_servers_norm.add(n)
+
+    if "server_norm" not in lift.columns:
+        lift["server_norm"] = lift["SERVER_NAME"].map(norm_server)
+    sql_lift_only = lift[lift["server_norm"].isin(sql_servers_norm)]
+    sql_lift_total_cost = float(
+        pd.to_numeric(sql_lift_only["TOTAL_MONTHLY_COST_USD"], errors="coerce").fillna(0).sum()
+    )
+
+    # SQL MI cost: MI compute + storage for MI-ready instances, plus VM cost for the rest
+    sql_mi_cost = _sum_cost(
+        sql_mi_df,
+        ["AZURE_SQL_MI_COMPUTE_MONTHLY_COST_USD", "AZURE_SQL_MI_STORAGE_MONTHLY_COST_USD"],
+    )
+    sql_vm_cost = _sum_cost(
+        sql_vm_df,
+        ["AZURE_SQL_VM_COMPUTE_MONTHLY_COST_USD", "AZURE_SQL_VM_STORAGE_MONTHLY_COST_USD"],
+    )
+    sql_hybrid_cost = sql_mi_cost + sql_vm_cost
+    sql_cost_delta = sql_lift_total_cost - sql_hybrid_cost
+
     web_counts = {
         "IIS Web Applications": int(discovery["resourceType"].eq("microsoft.offazure/mastersites/webappsites/iiswebapplications").sum()),
         "Tomcat Web Applications": int(discovery["resourceType"].eq("microsoft.offazure/mastersites/webappsites/tomcatwebapplications").sum()),
@@ -802,6 +918,20 @@ def load_metrics(input_dir: Path):
         "web_total": web_total,
         "sql_instance_count": sql_instance_count,
         "sql_server_count": sql_server_count,
+        "sql_versions": sql_versions,
+        "sql_vm_readiness": sql_vm_readiness,
+        "sql_vm_total": sql_vm_total,
+        "sql_mi_readiness": sql_mi_readiness,
+        "sql_mi_total": sql_mi_total,
+        "sql_lift_total_cost": sql_lift_total_cost,
+        "sql_hybrid_cost": sql_hybrid_cost,
+        "sql_mi_cost": sql_mi_cost,
+        "sql_vm_cost": sql_vm_cost,
+        "sql_cost_delta": sql_cost_delta,
+        "non_sql_db_total": non_sql_db_total,
+        "non_sql_db_counts": non_sql_db_counts,
+        "non_sql_db_readiness": non_sql_db_readiness,
+        "non_sql_db_readiness_total": non_sql_db_readiness_total,
         "onprem_storage_gb": onprem_storage_gb,
         "rec_storage_gb": rec_storage_gb,
         "onprem_cores": onprem_cores,
@@ -839,11 +969,15 @@ def add_source(slide, text, size=9):
 
 
 def add_bar(slide, x, y, w, h, value, max_value, color):
+    # Guard against degenerate dimensions; PowerPoint flags zero/negative shapes.
+    w = max(float(w), 0.01)
+    h = max(float(h), 0.01)
     bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
     bg.fill.solid()
     bg.fill.fore_color.rgb = ALT
     bg.line.fill.background()
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w * safe_div(value, max_value)), Inches(h))
+    fill_w = max(w * safe_div(value, max_value), 0.01)
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(fill_w), Inches(h))
     bar.fill.solid()
     bar.fill.fore_color.rgb = color
     bar.line.fill.background()
@@ -859,9 +993,9 @@ def add_vm_power_slide(prs, m):
     tick_max = int(math.ceil(max_count / 250.0) * 250) + 250
     for tick in range(0, tick_max + 1, 250):
         x = chart_x + chart_w * safe_div(tick, tick_max)
-        line = slide.shapes.add_shape(MSO_SHAPE.LINE_INVERSE, Inches(x), Inches(chart_y), Inches(0), Inches(chart_h))
-        line.line.color.rgb = LINE
-        line.line.width = Pt(0.5)
+        line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(chart_y), Inches(0.01), Inches(chart_h))
+        line.fill.solid(); line.fill.fore_color.rgb = LINE
+        line.line.fill.background()
         add_text(slide, f"{tick:,}", x - 0.25, chart_y + chart_h + 0.18, 0.5, 0.15, 9, MUTED, align=PP_ALIGN.CENTER)
     add_bar(slide, chart_x, chart_y + 0.2, chart_w, 0.28, m["powered_on"], max_count, TEAL)
     add_bar(slide, chart_x, chart_y + 0.75, chart_w * safe_div(m["powered_off"], max_count), 0.28, m["powered_off"], m["powered_off"] or 1, PINK)
@@ -986,6 +1120,88 @@ def add_db_slide(prs, m):
     add_source(slide, "Source: Discovery.xlsx, Data sheet. Database rows identified from database-related values in resourceType.", size=8)
 
 
+def add_non_sql_db_readiness_slide(prs, m):
+    slide = blank_slide(prs)
+    slide_title(
+        slide,
+        "Non-SQL Database Readiness",
+        "MongoDB, MySQL, and PostgreSQL readiness from Strategy_PaaS_Preferred.xlsx.",
+    )
+
+    counts = m["non_sql_db_counts"]
+    readiness_by_type = m["non_sql_db_readiness"]
+    readiness_total = m["non_sql_db_readiness_total"]
+    total = m["non_sql_db_total"]
+    db_types = ["MongoDB", "MySQL", "PostgreSQL"]
+    readiness_order = ["Unknown", "Ready", "Ready With Conditions", "Not Ready"]
+    readiness_colors = {
+        "Ready": GREEN,
+        "Ready With Conditions": YELLOW,
+        "Not Ready": RED,
+        "Unknown": GREY,
+    }
+
+    add_panel(slide, 0.70, 1.35, 11.95, 5.30, "Readiness by database type", title_size=17)
+
+    def lighter(color, amount=0.78):
+        return RGBColor(*(int(channel + (255 - channel) * amount) for channel in color))
+
+    status_labels = {
+        "Unknown": "Unknown",
+        "Ready": "Ready",
+        "Ready With Conditions": "Ready w/ conditions",
+        "Not Ready": "Not ready",
+    }
+    label_x = 1.00
+    grid_x = 2.55
+    grid_y = 2.25
+    cell_w = 2.25
+    cell_h = 0.72
+    row_gap = 0.08
+    col_gap = 0.08
+
+    for i, status in enumerate(readiness_order):
+        x = grid_x + i * (cell_w + col_gap)
+        color = readiness_colors[status]
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(grid_y), Inches(cell_w), Inches(cell_h))
+        rect.fill.solid(); rect.fill.fore_color.rgb = color; rect.line.fill.background()
+        text_color = WHITE if status != "Ready With Conditions" else NAVY
+        add_text(slide, status_labels[status], x + 0.10, grid_y + 0.20, cell_w - 0.20, 0.25, 12, text_color, True, align=PP_ALIGN.CENTER)
+
+    row_labels = db_types + ["Total"]
+    for r, row_label in enumerate(row_labels):
+        y = grid_y + (r + 1) * (cell_h + row_gap)
+        add_text(slide, row_label, label_x, y + 0.20, 1.25, 0.25, 12, NAVY, True)
+        row_counts = readiness_total if row_label == "Total" else readiness_by_type.get(row_label, {})
+        for c, status in enumerate(readiness_order):
+            x = grid_x + c * (cell_w + col_gap)
+            color = readiness_colors[status] if row_label == "Total" else lighter(readiness_colors[status])
+            rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(cell_w), Inches(cell_h))
+            rect.fill.solid(); rect.fill.fore_color.rgb = color
+            rect.line.color.rgb = WHITE
+            rect.line.width = Pt(1)
+            value = row_counts.get(status, 0)
+            text_color = WHITE if row_label == "Total" and status != "Ready With Conditions" else NAVY
+            add_text(slide, f"{value:,}", x + 0.10, y + 0.18, cell_w - 0.20, 0.28, 16, text_color, True, align=PP_ALIGN.CENTER)
+
+    add_text(
+        slide,
+        f"Total non-SQL database rows assessed: {total:,}",
+        1.00,
+        6.05,
+        4.75,
+        0.25,
+        11,
+        SLATE,
+        True,
+    )
+    add_source(
+        slide,
+        "Source: Strategy_PaaS_Preferred.xlsx sheets Mongo_to_Azure_Document_DB, MySQL_to_AzureFlexServerMySQL, and PgSQL_to_AzureFlexServerPG.",
+        size=8,
+    )
+
+
 def add_webapp_slide(prs, m):
     slide = blank_slide(prs)
     slide_title(slide, "Web Applications by Type", "Counted by webapp rows")
@@ -1099,27 +1315,210 @@ def add_fileshare_readiness_slide(prs, m, output_dir: Path):
 def add_sql_readiness_slide(prs, m):
     slide = blank_slide(prs)
     slide_title(slide, "SQL Readiness")
-    add_card(slide, 0.85, 1.25, 2.55, 1.55, f"{m['sql_instance_count']:,}", "SQL Server Instances", "", TEAL, value_size=40, label_size=12)
-    add_card(slide, 3.65, 1.25, 2.55, 1.55, f"{m['sql_server_count']:,}", "Servers running SQL", "", MINT, value_size=40, label_size=12)
 
+    # KPI strip
+    def sql_kpi_card(x, value, label, accent):
+        w, h, y = 2.4, 0.60, 1.00
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+        rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
+        rect.line.color.rgb = LINE; rect.line.width = Pt(1)
+        bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(0.05))
+        bar.fill.solid(); bar.fill.fore_color.rgb = accent; bar.line.fill.background()
+        add_text(slide, value, x + 0.12, y + 0.12, w - 0.24, 0.24, 18, NAVY, True)
+        add_text(slide, label, x + 0.12, y + 0.40, w - 0.24, 0.15, 8, SLATE, True)
+
+    sql_kpi_card(0.55, f"{m['sql_instance_count']:,}", "SQL Server Instances", TEAL)
+    sql_kpi_card(3.10, f"{m['sql_server_count']:,}", "Servers running SQL", MINT)
     instances_per_server = m["sql_instance_count"] / m["sql_server_count"] if m["sql_server_count"] else 0
-    add_panel(slide, 6.45, 1.25, 6.0, 1.55, "Density", title_size=14)
-    add_text(slide, f"{instances_per_server:.1f}", 6.65, 1.75, 2.0, 0.7, 40, NAVY, True)
-    add_text(slide, "Average SQL Server instances per host", 8.8, 1.95, 3.5, 0.6, 11, SLATE, True)
+    sql_kpi_card(5.65, f"{instances_per_server:.1f}", "Instances per server", TEAL)
 
-    rows = [
-        ["Metric", "Count"],
-        ["SQL Server Instances", f"{m['sql_instance_count']:,}"],
-        ["Unique servers running SQL", f"{m['sql_server_count']:,}"],
+    # Cost comparison — compact panel with three inner cards
+    lift_cost = float(m.get("sql_lift_total_cost", 0) or 0)
+    hybrid_cost = float(m.get("sql_hybrid_cost", 0) or 0)
+    yearly_lift = lift_cost * 12
+    yearly_hybrid = hybrid_cost * 12
+    yearly_savings = yearly_lift - yearly_hybrid  # positive => MI saves money
+    savings_color = GREEN if yearly_savings >= 0 else RED
+
+    cost_panel_y = 1.78
+    cost_panel_h = 1.05
+    add_panel(slide, 0.55, cost_panel_y, 12.30, cost_panel_h, "Lift & Shift vs SQL MI (where ready) + Lift & Shift remainder", title_size=11)
+
+    inner_y = cost_panel_y + 0.35
+    inner_h = cost_panel_h - 0.45
+    gap = 0.15
+    inner_w = (12.30 - 0.30 - gap * 2) / 3
+
+    def cost_card(x, accent, headline, big_value, sub_text, value_color=None):
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(inner_y), Inches(inner_w), Inches(inner_h))
+        rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
+        rect.line.color.rgb = LINE; rect.line.width = Pt(1)
+        bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(inner_y), Inches(inner_w), Inches(0.05))
+        bar.fill.solid(); bar.fill.fore_color.rgb = accent; bar.line.fill.background()
+        add_text(slide, headline, x + 0.16, inner_y + 0.08, inner_w - 0.32, 0.18, 9, NAVY, True)
+        add_text(slide, big_value, x + 0.16, inner_y + 0.27, inner_w - 0.32, 0.25, 17, value_color or NAVY, True)
+        add_text(slide, sub_text, x + 0.16, inner_y + 0.50, inner_w - 0.32, 0.14, 7, MUTED)
+
+    x0 = 0.70
+    cost_card(x0, RED, "100% Lift & Shift",
+              money_k(lift_cost),
+              f"per month   /   {money_full(yearly_lift)}/yr")
+    cost_card(x0 + inner_w + gap, TEAL, "SQL MI (where ready) + Lift & Shift",
+              money_k(hybrid_cost),
+              f"per month   /   {money_full(yearly_hybrid)}/yr")
+    cost_card(x0 + (inner_w + gap) * 2, savings_color, "Yearly Savings Using SQL MI",
+              money_full(yearly_savings),
+              f"{money_full(yearly_savings / 12)} per month",
+              value_color=savings_color)
+
+    # Licensing snapshot (placeholder values — wire real data in once available)
+    lic_y = 2.98
+    lic_h = 1.10
+    add_panel(slide, 0.55, lic_y, 12.30, lic_h, "SQL Server Licensing — owned vs. need", title_size=12)
+
+    # Random-ish placeholder values until real data is wired in
+    licensing_rows = [
+        ("SQL Server Standard",   m.get("sql_std_owned",  18), m.get("sql_std_needed",  24)),
+        ("SQL Server Enterprise", m.get("sql_ent_owned",  12), m.get("sql_ent_needed",  8)),
     ]
-    add_panel(slide, 1.8, 3.25, 9.2, 2.6, "SQL Server inventory", title_size=17)
-    add_table(slide, rows, 2.0, 3.92, 8.8, 1.8, 12, col_widths=[5.6, 3.2])
+
+    def licensing_card(x, w, edition, owned, needed):
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(lic_y + 0.40), Inches(w), Inches(lic_h - 0.50))
+        rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
+        rect.line.color.rgb = LINE; rect.line.width = Pt(1)
+
+        try:
+            o = float(owned); n = float(needed)
+            delta_pct = (o - n) / n * 100 if n else 0
+            delta_txt = f"{delta_pct:+.1f}%  {'surplus' if delta_pct >= 0 else 'deficit'}"
+            delta_color = GREEN if delta_pct >= 0 else RED
+            owned_txt = f"{int(o):,}"
+            needed_txt = f"{int(n):,}"
+        except (TypeError, ValueError):
+            delta_txt = "—"
+            delta_color = MUTED
+            owned_txt = str(owned)
+            needed_txt = str(needed)
+
+        add_text(slide, edition, x + 0.18, lic_y + 0.43, w - 0.36, 0.20, 10, NAVY, True)
+        col_w = (w - 0.36) / 3
+        cx = x + 0.18
+        row_y = lic_y + 0.64
+        add_text(slide, "Owned",    cx,                row_y,        col_w, 0.16, 8, MUTED)
+        add_text(slide, owned_txt,  cx,                row_y + 0.15, col_w, 0.22, 13, NAVY, True)
+        add_text(slide, "Need",     cx + col_w,        row_y,        col_w, 0.16, 8, MUTED)
+        add_text(slide, needed_txt, cx + col_w,        row_y + 0.15, col_w, 0.22, 13, NAVY, True)
+        add_text(slide, "Delta",    cx + col_w * 2,    row_y,        col_w, 0.16, 8, MUTED)
+        add_text(slide, delta_txt,  cx + col_w * 2,    row_y + 0.15, col_w, 0.22, 10, delta_color, True)
+
+    card_w = (12.30 - 0.30 - 0.15) / 2
+    licensing_card(0.70,                       card_w, *licensing_rows[0])
+    licensing_card(0.70 + card_w + 0.15,       card_w, *licensing_rows[1])
+
+    # Versions chart (left)
+    pss_colors = {
+        "Mainstream":   GREEN,
+        "Extended":     YELLOW,
+        "OutOfSupport": RED,
+        "Unknown":      GREY,
+    }
+    versions_y = 4.25
+    versions_h = 2.35
+    add_panel(slide, 0.55, versions_y, 6.4, versions_h, "SQL Server versions by support status", title_size=13)
+    legend_y = versions_y + 0.40
+    for i, (label, color) in enumerate([("Mainstream", GREEN), ("Extended", YELLOW), ("Out of support", RED), ("Unknown", GREY)]):
+        x = 0.75 + i * 1.55
+        sw = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(legend_y), Inches(0.16), Inches(0.11))
+        sw.fill.solid(); sw.fill.fore_color.rgb = color; sw.line.fill.background()
+        add_text(slide, label, x + 0.22, legend_y - 0.05, 1.3, 0.22, 8, SLATE, True)
+
+    versions = m.get("sql_versions") or []
+    if not versions:
+        add_text(slide, "No SQL version data available in Discovery.xlsx.", 0.75, versions_y + 0.75, 6.0, 0.3, 10, MUTED)
+    else:
+        max_count = max(c for *_x, c in versions) or 1
+        rows_top = versions_y + 0.75
+        row_h = min(0.20, (versions_y + versions_h - 0.05 - rows_top) / max(len(versions), 1))
+        bar_x = 2.30
+        bar_w = 3.55
+        for i, (version, status, count) in enumerate(versions):
+            y = rows_top + i * row_h
+            color = pss_colors.get(status, GREY)
+            add_text(slide, version, 0.7, y, 1.55, row_h - 0.02, 9, SLATE, True)
+            add_bar(slide, bar_x, y + 0.04, bar_w, row_h - 0.10, count, max_count, color)
+            add_text(slide, f"{count:,}", bar_x + bar_w + 0.05, y, 0.85, row_h - 0.02, 9, NAVY, True)
+
+    # SQL Readiness by Target (right) — vertical grouped column chart
+    target_y = versions_y
+    target_h = versions_h
+    panel_x = 7.10
+    panel_w = 5.75
+    add_panel(slide, panel_x, target_y, panel_w, target_h, "SQL Readiness by Target", title_size=13)
+    categories = ["Ready", "Not Ready", "Ready With Conditions", "Unknown"]
+    vm_counts = m.get("sql_vm_readiness", {})
+    mi_counts = m.get("sql_mi_readiness", {})
+    vm_total = m.get("sql_vm_total", 0)
+    mi_total = m.get("sql_mi_total", 0)
+
+    # Legend
+    leg_y = target_y + 0.40
+    sw1 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(panel_x + 0.20), Inches(leg_y), Inches(0.16), Inches(0.11))
+    sw1.fill.solid(); sw1.fill.fore_color.rgb = ORANGE; sw1.line.fill.background()
+    add_text(slide, f"SQL VM Instances ({vm_total})", panel_x + 0.40, leg_y - 0.05, 2.4, 0.22, 8, SLATE, True, font="Aptos")
+    sw2 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(panel_x + 2.90), Inches(leg_y), Inches(0.16), Inches(0.11))
+    sw2.fill.solid(); sw2.fill.fore_color.rgb = NAVY; sw2.line.fill.background()
+    add_text(slide, f"SQL MI Instances ({mi_total})", panel_x + 3.10, leg_y - 0.05, 2.5, 0.22, 8, SLATE, True, font="Aptos")
+
+    # Chart plotting area
+    chart_top = target_y + 0.75
+    chart_bottom = target_y + target_h - 0.30  # leave room for x-axis labels
+    chart_left = panel_x + 0.25
+    chart_right = panel_x + panel_w - 0.10
+    chart_h = chart_bottom - chart_top
+
+    max_bar = max([vm_counts.get(c, 0) for c in categories] + [mi_counts.get(c, 0) for c in categories] + [1])
+    group_w = (chart_right - chart_left) / len(categories)
+    bar_gap = 0.04
+    bar_w = max(0.18, (group_w - 0.30 - bar_gap) / 2)
+
+    def vbar(x, value, color):
+        h = max(0.02, chart_h * safe_div(value, max_bar))
+        # background track (full height) for visual reference
+        bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(chart_top), Inches(bar_w), Inches(chart_h))
+        bg.fill.solid(); bg.fill.fore_color.rgb = ALT; bg.line.fill.background()
+        # actual bar grows from bottom
+        bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(chart_bottom - h), Inches(bar_w), Inches(h))
+        bar.fill.solid(); bar.fill.fore_color.rgb = color; bar.line.fill.background()
+        return chart_bottom - h  # return top-of-bar y
+
+    for i, cat in enumerate(categories):
+        gx = chart_left + i * group_w
+        # Center the bar pair within the group
+        pair_w = 2 * bar_w + bar_gap
+        b1x = gx + (group_w - pair_w) / 2
+        b2x = b1x + bar_w + bar_gap
+        vm_val = vm_counts.get(cat, 0)
+        mi_val = mi_counts.get(cat, 0)
+        vm_top = vbar(b1x, vm_val, ORANGE)
+        mi_top = vbar(b2x, mi_val, NAVY)
+        # Value labels above each bar
+        add_text(slide, f"{vm_val:,}", b1x - 0.08, vm_top - 0.20, bar_w + 0.16, 0.18, 8, NAVY, True, font="Aptos", align=PP_ALIGN.CENTER)
+        add_text(slide, f"{mi_val:,}", b2x - 0.08, mi_top - 0.20, bar_w + 0.16, 0.18, 8, NAVY, True, font="Aptos", align=PP_ALIGN.CENTER)
+        # X-axis category label
+        label = "Ready w/\nConditions" if cat == "Ready With Conditions" else cat
+        add_text(slide, label, gx, chart_bottom + 0.04, group_w, 0.26, 8, SLATE, True, font="Aptos", align=PP_ALIGN.CENTER)
+
     add_source(
         slide,
-        "Source: Discovery.xlsx, Data sheet. SQL Server Instances = rows where resourceType = microsoft.offazure/mastersites/sqlsites/sqlservers. "
-        "Servers running SQL = distinct parentResourceName values for those same rows.",
-        size=8,
+        "Sources: Discovery.xlsx Data (SQL instances & versions); Strategy_PaaS_Preferred.xlsx SQLinstance_to_AzureSQLVM "
+        "(AZURE_SQL_VM_READINESS + AZURE_SQL_VM_COMPUTE/STORAGE_MONTHLY_COST_USD) and SQLinstance_to_AzureSQLMI "
+        "(AZURE_SQL_MI_READINESS + AZURE_SQL_MI_COMPUTE/STORAGE_MONTHLY_COST_USD); Strategy_Lift_and_shift.xlsx "
+        "Server_to_AzureVM (TOTAL_MONTHLY_COST_USD for servers in either SQL sheet, deduplicated).",
+        size=7,
     )
+
+
+def add_title_slide(prs):
     slide = blank_slide(prs)
     slide.background.fill.solid()
     slide.background.fill.fore_color.rgb = NAVY
@@ -1132,10 +1531,48 @@ def add_sql_readiness_slide(prs, m):
     add_text(slide, "Discovery and assessment summary", 0.6, 4.05, SLIDE_W - 1.2, 0.5, 20, RGBColor(202, 220, 252), False, align=PP_ALIGN.CENTER)
 
 
+def is_file_locked(path: Path) -> bool:
+    """Return True if the file exists and cannot be opened for read+write
+    (e.g. open in Excel/PowerPoint with an exclusive lock)."""
+    if not path.exists():
+        return False
+    try:
+        with open(path, "r+b"):
+            return False
+    except (PermissionError, OSError):
+        return True
+
+
+def wait_until_unlocked(paths: list[Path], label: str = "files") -> None:
+    """If any of the given paths are locked, list them and prompt the user
+    to close them. Re-checks after each prompt until all are unlocked."""
+    while True:
+        locked = [p for p in paths if is_file_locked(p)]
+        if not locked:
+            return
+        log("")
+        log(f"The following {label} appear to be open in another program (likely Excel or PowerPoint):")
+        for p in locked:
+            log(f"  - {p}")
+        try:
+            input("Close them, then press ENTER to retry (Ctrl+C to abort)... ")
+        except EOFError:
+            raise RuntimeError("Locked files and no console available to prompt the user")
+
+
 def build_deck(input_dir: Path, output: Path):
     log(f"Input  : {input_dir}")
     log(f"Output : {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
+
+    files_to_check = [
+        input_dir / "Discovery.xlsx",
+        input_dir / "Strategy_Lift_and_shift.xlsx",
+        input_dir / "Strategy_PaaS_Preferred.xlsx",
+        output,
+    ]
+    wait_until_unlocked(files_to_check, label="workbooks/output deck")
+
     log("Loading source workbooks...")
     m = load_metrics(input_dir)
     log("Source data loaded:")
@@ -1145,26 +1582,62 @@ def build_deck(input_dir: Path, output: Path):
     log(f"  Web apps       : {m['web_total']:,}")
     log("Building slides...")
     prs = new_deck()
-    log("  [1/9] Title")
+    log("  [1/10] Title")
     add_title_slide(prs)
-    log("  [2/9] Consolidated Infrastructure Summary")
+    log("  [2/10] Consolidated Infrastructure Summary")
     add_consolidated_slide(prs, m)
-    log("  [3/9] Fileshare Readiness")
+    log("  [3/10] Fileshare Readiness")
     add_fileshare_readiness_slide(prs, m, output.parent)
-    log("  [4/9] VM Power State Summary")
+    log("  [4/10] VM Power State Summary")
     add_vm_power_slide(prs, m)
-    log("  [5/9] VM Utilization Summary")
+    log("  [5/10] VM Utilization Summary")
     add_vm_utilization_slide(prs, m)
-    log("  [6/9] Fileshares by Host OS Category")
+    log("  [6/10] Fileshares by Host OS Category")
     add_fileshare_os_slide(prs, m)
-    log("  [7/9] Database Resources by Type")
+    log("  [7/10] Database Resources by Type")
     add_db_slide(prs, m)
-    log("  [8/9] SQL Readiness")
+    log("  [8/10] Non-SQL Database Readiness")
+    add_non_sql_db_readiness_slide(prs, m)
+    log("  [9/10] SQL Readiness")
     add_sql_readiness_slide(prs, m)
-    log("  [9/9] Web Applications by Type")
+    log("  [10/10] Web Applications by Type")
     add_webapp_slide(prs, m)
     log("Saving deck...")
-    prs.save(output)
+    # Write to a local temp file first, validate, then move to the final path.
+    # This prevents PowerPoint/OneDrive from seeing a partially-written file
+    # if the output path is inside a OneDrive-synced folder.
+    tmp_dir = Path(tempfile.mkdtemp(prefix="azmigrate-deck-"))
+    tmp_path = tmp_dir / output.name
+    try:
+        prs.save(tmp_path)
+        # Validate that the saved file is a valid Open XML package (zip).
+        import zipfile as _zf
+        with _zf.ZipFile(tmp_path, "r") as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                raise RuntimeError(f"Saved deck failed zip integrity check on entry: {bad}")
+        # Replace the destination atomically; retry briefly if OneDrive briefly holds it.
+        import time
+        last_err = None
+        for attempt in range(5):
+            try:
+                if output.exists():
+                    output.unlink()
+                shutil.move(str(tmp_path), str(output))
+                break
+            except PermissionError as exc:
+                last_err = exc
+                log(f"  Target {output.name} is locked (attempt {attempt + 1}/5); retrying in 2s...")
+                time.sleep(2)
+        else:
+            raise RuntimeError(f"Could not move deck into place: {last_err}")
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            tmp_dir.rmdir()
+        except OSError:
+            pass
     log(f"Done. Wrote {output}")
 
 
