@@ -1411,19 +1411,30 @@ def add_webapp_readiness_slide(prs, m, output_dir: Path):
     def status_label(status):
         return status.replace("Ready With Conditions", "Ready w/ conditions").replace("OutOfSupport", "Out of support")
 
-    add_panel(slide, 0.55, 1.12, 4.15, 2.55, "WebApp type distribution", title_size=13)
-    pie_values = {web_type: int(webapp_by_type[web_type]["webapps"]) for web_type in web_types}
-    pie_path = create_pie_image(output_dir / "webapp-type-distribution.png", "WebApp Types", pie_values, type_colors)
-    slide.shapes.add_picture(str(pie_path), Inches(0.82), Inches(1.38), Inches(3.25), Inches(2.25))
-
-    add_panel(slide, 4.95, 1.12, 7.75, 2.55, "WebApps and hosting servers", title_size=13)
-    count_rows = [["WebApp type", "WebApps", "Unique servers"]]
-    for web_type in web_types:
-        row = webapp_by_type[web_type]
-        count_rows.append([web_type, f"{row['webapps']:,}", f"{row['servers']:,}"])
-    row = webapp_by_type["Total"]
-    count_rows.append(["Total", f"{row['webapps']:,}", f"{row['servers']:,}"])
-    add_table(slide, count_rows, 5.22, 1.78, 7.10, 1.35, 11, col_widths=[2.85, 2.05, 2.20])
+    add_panel(slide, 0.55, 1.12, 12.15, 2.55, "WebApps and hosting servers", title_size=13)
+    label_x = 0.88
+    count_x = 3.25
+    count_y = 1.78
+    count_cell_w = 2.45
+    count_cell_h = 0.34
+    count_gap = 0.08
+    count_headers = [("WebApps", TEAL), ("Server Count", NAVY)]
+    for i, (header, color) in enumerate(count_headers):
+        x = count_x + i * (count_cell_w + count_gap)
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(count_y), Inches(count_cell_w), Inches(count_cell_h))
+        rect.fill.solid(); rect.fill.fore_color.rgb = color; rect.line.fill.background()
+        add_text(slide, header, x + 0.10, count_y + 0.08, count_cell_w - 0.20, 0.18, 10, WHITE, True, align=PP_ALIGN.CENTER)
+    for r, row_label in enumerate([*web_types, "Total"]):
+        y = count_y + (r + 1) * (count_cell_h + count_gap)
+        add_text(slide, row_label, label_x, y + 0.08, 1.25, 0.18, 10, NAVY, True)
+        row = webapp_by_type[row_label]
+        values = [row["webapps"], row["servers"]]
+        for c, value in enumerate(values):
+            x = count_x + c * (count_cell_w + count_gap)
+            rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(count_cell_w), Inches(count_cell_h))
+            rect.fill.solid(); rect.fill.fore_color.rgb = NAVY if row_label == "Total" else ALT
+            rect.line.color.rgb = WHITE; rect.line.width = Pt(1)
+            add_text(slide, f"{value:,}", x + 0.10, y + 0.08, count_cell_w - 0.20, 0.18, 11, WHITE if row_label == "Total" else NAVY, True, align=PP_ALIGN.CENTER)
 
     def draw_stacked_matrix(panel_x, panel_y, panel_w, title, columns, row_values, colors):
         add_panel(slide, panel_x, panel_y, panel_w, 2.52, title, title_size=13)
@@ -1456,36 +1467,40 @@ def add_webapp_readiness_slide(prs, m, output_dir: Path):
                 text_color = WHITE if row_label == "Total" and col not in {"Extended", "Ready With Conditions"} else NAVY
                 add_text(slide, f"{values.get(col, 0):,}", x + 0.04, y + 0.08, cell_w - col_gap - 0.08, 0.17, 9, text_color, True, align=PP_ALIGN.CENTER)
 
-    add_panel(slide, 0.55, 4.02, 5.95, 2.52, "directSupportStatus by type", title_size=13)
+    add_panel(slide, 0.55, 4.02, 5.95, 2.52, "Support Status", title_size=13)
     support_rows = {web_type: webapp_by_type[web_type]["support_counts"] for web_type in web_types}
     support_rows["Total"] = webapp_by_type["Total"]["support_counts"]
-    support_max = max([sum(support_rows[row].get(status, 0) for status in support_order) for row in [*web_types, "Total"]] + [1])
-    bar_x, bar_w = 2.00, 3.45
-    row_y = 4.92
-    for i, row_label in enumerate([*web_types, "Total"]):
-        y = row_y + i * 0.42
-        add_text(slide, row_label, 0.82, y + 0.03, 0.85, 0.18, 9, NAVY, True)
-        x = bar_x
-        for status in support_order:
-            value = support_rows[row_label].get(status, 0)
-            seg_w = max(0.01, bar_w * safe_div(value, support_max))
-            color = support_colors.get(status, TEAL) if row_label == "Total" else lighter(support_colors.get(status, TEAL))
-            seg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y + 0.04), Inches(seg_w), Inches(0.18))
-            seg.fill.solid(); seg.fill.fore_color.rgb = color; seg.line.fill.background()
-            if value:
-                text_color = WHITE if row_label == "Total" and status != "Extended" else NAVY
-                add_text(slide, f"{value:,}", x + 0.03, y + 0.045, max(0.22, seg_w - 0.06), 0.14, 7, text_color, True, align=PP_ALIGN.CENTER)
-            x += seg_w
-    legend_y = 4.50
+    support_max = max([support_rows[row].get(status, 0) for row in web_types for status in support_order] + [1])
+    chart_left = 0.95
+    chart_top = 4.78
+    chart_bottom = 6.08
+    chart_h = chart_bottom - chart_top
+    group_w = 5.10 / len(support_order)
+    bar_w = 0.18
+    bar_gap = 0.07
     for i, status in enumerate(support_order):
-        x = 0.85 + i * 1.25
+        group_x = chart_left + i * group_w
+        pair_w = len(web_types) * bar_w + (len(web_types) - 1) * bar_gap
+        x0 = group_x + (group_w - pair_w) / 2
+        for j, web_type in enumerate(web_types):
+            value = support_rows[web_type].get(status, 0)
+            h = max(0.01, chart_h * safe_div(value, support_max))
+            x = x0 + j * (bar_w + bar_gap)
+            bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(chart_bottom - h), Inches(bar_w), Inches(h))
+            bar.fill.solid(); bar.fill.fore_color.rgb = type_colors[web_type]; bar.line.fill.background()
+            if value:
+                add_text(slide, f"{value:,}", x - 0.12, chart_bottom - h - 0.16, bar_w + 0.24, 0.13, 6, NAVY, True, align=PP_ALIGN.CENTER)
+        add_text(slide, status_label(status), group_x + 0.02, chart_bottom + 0.06, group_w - 0.04, 0.22, 7, SLATE, True, align=PP_ALIGN.CENTER)
+    legend_y = 4.42
+    for i, web_type in enumerate(web_types):
+        x = 0.85 + i * 1.05
         sw = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(legend_y), Inches(0.12), Inches(0.10))
-        sw.fill.solid(); sw.fill.fore_color.rgb = support_colors.get(status, TEAL); sw.line.fill.background()
-        add_text(slide, status_label(status), x + 0.17, legend_y - 0.04, 1.00, 0.16, 7, SLATE, True)
+        sw.fill.solid(); sw.fill.fore_color.rgb = type_colors[web_type]; sw.line.fill.background()
+        add_text(slide, web_type, x + 0.17, legend_y - 0.04, 0.70, 0.16, 7, SLATE, True)
 
     readiness_rows = {web_type: readiness_by_type.get(web_type, {}) for web_type in web_types}
     readiness_rows["Total"] = readiness_total
-    draw_stacked_matrix(6.75, 4.02, 5.95, "AKS readiness by type", readiness_order, readiness_rows, readiness_colors)
+    draw_stacked_matrix(6.75, 4.02, 5.95, "Readiness", readiness_order, readiness_rows, readiness_colors)
 
     add_source(
         slide,
@@ -1732,7 +1747,7 @@ def add_sql_readiness_slide(prs, m):
         x = 0.75 + i * 1.55
         sw = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(legend_y), Inches(0.16), Inches(0.11))
         sw.fill.solid(); sw.fill.fore_color.rgb = color; sw.line.fill.background()
-        add_text(slide, label, x + 0.22, legend_y - 0.05, 1.3, 0.22, 8, SLATE, True)
+        add_text(slide, label, x + 0.22, legend_y - 0.05, 1.3, 0.22, 10, SLATE, True, font="Aptos")
 
     versions = m.get("sql_versions") or []
     if not versions:
@@ -1766,10 +1781,10 @@ def add_sql_readiness_slide(prs, m):
     leg_y = target_y + 0.40
     sw1 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(panel_x + 0.20), Inches(leg_y), Inches(0.16), Inches(0.11))
     sw1.fill.solid(); sw1.fill.fore_color.rgb = ORANGE; sw1.line.fill.background()
-    add_text(slide, f"SQL VM Instances ({vm_total})", panel_x + 0.40, leg_y - 0.05, 2.4, 0.22, 8, SLATE, True, font="Aptos")
+    add_text(slide, f"SQL VM Instances ({vm_total})", panel_x + 0.40, leg_y - 0.05, 2.4, 0.22, 10, SLATE, True, font="Aptos")
     sw2 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(panel_x + 2.90), Inches(leg_y), Inches(0.16), Inches(0.11))
     sw2.fill.solid(); sw2.fill.fore_color.rgb = NAVY; sw2.line.fill.background()
-    add_text(slide, f"SQL MI Instances ({mi_total})", panel_x + 3.10, leg_y - 0.05, 2.5, 0.22, 8, SLATE, True, font="Aptos")
+    add_text(slide, f"SQL MI Instances ({mi_total})", panel_x + 3.10, leg_y - 0.05, 2.5, 0.22, 10, SLATE, True, font="Aptos")
 
     # Chart plotting area
     chart_top = target_y + 0.75
@@ -1807,8 +1822,10 @@ def add_sql_readiness_slide(prs, m):
         add_text(slide, f"{vm_val:,}", b1x - 0.08, vm_top - 0.20, bar_w + 0.16, 0.18, 8, NAVY, True, font="Aptos", align=PP_ALIGN.CENTER)
         add_text(slide, f"{mi_val:,}", b2x - 0.08, mi_top - 0.20, bar_w + 0.16, 0.18, 8, NAVY, True, font="Aptos", align=PP_ALIGN.CENTER)
         # X-axis category label
-        label = "Ready w/\nConditions" if cat == "Ready With Conditions" else cat
-        add_text(slide, label, gx, chart_bottom + 0.04, group_w, 0.26, 8, SLATE, True, font="Aptos", align=PP_ALIGN.CENTER)
+        label = "Ready w/ Conditions" if cat == "Ready With Conditions" else cat
+        label_w = 1.55 if cat == "Ready With Conditions" else group_w
+        label_x = gx + (group_w - label_w) / 2
+        add_text(slide, label, label_x, chart_bottom + 0.04, label_w, 0.18, 9, SLATE, True, font="Aptos", align=PP_ALIGN.CENTER)
 
     add_source(
         slide,
