@@ -24,6 +24,7 @@ import ast
 import csv
 import io
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -274,6 +275,92 @@ def _col_letter(n: int) -> str:
     return s
 
 
+def ensure_recommended_memory_openpyxl(lift_path: Path) -> list[str]:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(lift_path)
+    if "Server_to_AzureVM" not in wb.sheetnames:
+        raise RuntimeError("Server_to_AzureVM sheet not found in lift workbook")
+    ws = wb["Server_to_AzureVM"]
+
+    def header_map():
+        return {
+            str(cell.value).strip(): idx
+            for idx, cell in enumerate(ws[1], start=1)
+            if cell.value is not None and str(cell.value).strip()
+        }
+
+    headers = header_map()
+    if "RECOMMENDED_COMPUTE_SKU" not in headers:
+        raise RuntimeError("RECOMMENDED_COMPUTE_SKU column not found")
+
+    existing_memory: dict[str, float] = {}
+    if "Azure SKUs" in wb.sheetnames:
+        sku_ws = wb["Azure SKUs"]
+        for row in sku_ws.iter_rows(min_row=2, values_only=True):
+            sku_val = row[0] if len(row) > 0 else None
+            mem_val = row[1] if len(row) > 1 else None
+            if sku_val is None:
+                continue
+            key = str(sku_val).strip()
+            if not key:
+                continue
+            try:
+                if mem_val is not None and str(mem_val).strip() != "":
+                    existing_memory[key] = float(mem_val)
+            except (TypeError, ValueError):
+                pass
+        del wb["Azure SKUs"]
+
+    if "Recommended Memory" in headers:
+        ws.delete_cols(headers["Recommended Memory"])
+        headers = header_map()
+
+    sku_col = headers["RECOMMENDED_COMPUTE_SKU"]
+    skus = {
+        str(ws.cell(row=r, column=sku_col).value).strip()
+        for r in range(2, ws.max_row + 1)
+        if ws.cell(row=r, column=sku_col).value is not None
+        and str(ws.cell(row=r, column=sku_col).value).strip()
+        and str(ws.cell(row=r, column=sku_col).value).strip().lower() != "unknown"
+    }
+
+    github_map = fetch_github_sku_map()
+    sku_memory: dict[str, float] = {}
+    blanks: list[str] = []
+    for sku in sorted(skus):
+        if sku in existing_memory:
+            sku_memory[sku] = existing_memory[sku]
+        elif sku in github_map:
+            sku_memory[sku] = float(github_map[sku])
+        else:
+            mem = recommended_memory_gb(sku)
+            if mem is not None:
+                sku_memory[sku] = float(mem)
+            else:
+                blanks.append(sku)
+
+    sku_ws = wb.create_sheet("Azure SKUs", len(wb.worksheets))
+    sku_ws.cell(row=1, column=1).value = "Azure SKU"
+    sku_ws.cell(row=1, column=2).value = "Memory (GB)"
+    for row_idx, sku in enumerate(sorted(skus), start=2):
+        sku_ws.cell(row=row_idx, column=1).value = sku
+        if sku in sku_memory:
+            sku_ws.cell(row=row_idx, column=2).value = sku_memory[sku]
+
+    target_col = sku_col + 1
+    ws.insert_cols(target_col)
+    ws.cell(row=1, column=target_col).value = "Recommended Memory"
+    for r in range(2, ws.max_row + 1):
+        sku_val = ws.cell(row=r, column=sku_col).value
+        sku = "" if sku_val is None else str(sku_val).strip()
+        ws.cell(row=r, column=target_col).value = sku_memory.get(sku)
+
+    wb.save(lift_path)
+    wb.close()
+    return blanks
+
+
 def ensure_recommended_memory(lift_path: Path) -> None:
     """In Strategy_Lift_and_shift.xlsx, create/refresh:
        - sheet 'Azure SKUs' with [Azure SKU, Memory (GB)] for every SKU in
@@ -281,143 +368,17 @@ def ensure_recommended_memory(lift_path: Path) -> None:
        - column 'Recommended Memory' in Server_to_AzureVM (right after
          RECOMMENDED_COMPUTE_SKU) populated by VLOOKUP into 'Azure SKUs'
 
-    Uses Excel automation so formulas are evaluated and saved.
+    Uses direct .xlsx editing to avoid Excel COM failures when the desktop
+    Excel process is busy.
     """
-    try:
-        import win32com.client  # type: ignore
-    except ImportError as exc:
-        raise RuntimeError(
-            "pywin32 required to update the workbook. Install with: "
-            "python -m pip install pywin32"
-        ) from exc
-
     log(f"  Updating {lift_path.name}: Azure SKUs sheet + Recommended Memory column")
-    excel = win32com.client.DispatchEx("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
-    wb = None
-    try:
-        wb = excel.Workbooks.Open(str(lift_path))
-        try:
-            ws = wb.Worksheets("Server_to_AzureVM")
-        except Exception as exc:
-            raise RuntimeError("Server_to_AzureVM sheet not found in lift workbook") from exc
-
-        used = ws.UsedRange
-        last_col = used.Columns.Count
-        last_row = used.Rows.Count
-
-        # Map header -> column index
-        def header_map():
-            m = {}
-            cols = ws.UsedRange.Columns.Count
-            for c in range(1, cols + 1):
-                v = ws.Cells(1, c).Value
-                if v is not None:
-                    m[str(v).strip()] = c
-            return m
-
-        headers = header_map()
-        if "RECOMMENDED_COMPUTE_SKU" not in headers:
-            raise RuntimeError("RECOMMENDED_COMPUTE_SKU column not found")
-
-        # Remove any pre-existing 'Recommended Memory' column (anywhere) so we
-        # always re-insert it cleanly right after RECOMMENDED_COMPUTE_SKU.
-        if "Recommended Memory" in headers:
-            ws.Columns(headers["Recommended Memory"]).Delete()
-            headers = header_map()
-
-        sku_col = headers["RECOMMENDED_COMPUTE_SKU"]
-        sku_letter = _col_letter(sku_col)
-
-        # Collect unique SKUs (skip blanks and 'Unknown')
-        skus = set()
-        for r in range(2, last_row + 1):
-            v = ws.Cells(r, sku_col).Value
-            if v is None:
-                continue
-            text = str(v).strip()
-            if text and text.lower() != "unknown":
-                skus.add(text)
-
-        # Preserve any user-supplied memory values already present in the
-        # existing Azure SKUs sheet — the workbook is the source of truth.
-        existing_memory: dict[str, float] = {}
-        try:
-            existing_ws = wb.Worksheets("Azure SKUs")
-        except Exception:
-            existing_ws = None
-        if existing_ws is not None:
-            try:
-                ex_used = existing_ws.UsedRange
-                ex_rows = ex_used.Rows.Count
-                for r in range(2, ex_rows + 1):
-                    sku_val = existing_ws.Cells(r, 1).Value
-                    mem_val = existing_ws.Cells(r, 2).Value
-                    if sku_val is None:
-                        continue
-                    key = str(sku_val).strip()
-                    if not key:
-                        continue
-                    try:
-                        if mem_val is not None and str(mem_val).strip() != "":
-                            existing_memory[key] = float(mem_val)
-                    except (TypeError, ValueError):
-                        pass
-            except Exception:
-                pass
-            try:
-                existing_ws.Delete()
-            except Exception:
-                pass
-
-        # (Re)create the 'Azure SKUs' lookup sheet, preserving user-entered values
-        github_map = fetch_github_sku_map()
-        sku_ws = wb.Worksheets.Add(After=ws)
-        sku_ws.Name = "Azure SKUs"
-        sku_ws.Cells(1, 1).Value = "Azure SKU"
-        sku_ws.Cells(1, 2).Value = "Memory (GB)"
-        blanks: list[str] = []
-        for i, sku in enumerate(sorted(skus), start=2):
-            sku_ws.Cells(i, 1).Value = sku
-            if sku in existing_memory:
-                sku_ws.Cells(i, 2).Value = existing_memory[sku]
-                continue
-            if sku in github_map:
-                sku_ws.Cells(i, 2).Value = float(github_map[sku])
-                continue
-            mem = recommended_memory_gb(sku)
-            if mem is not None:
-                sku_ws.Cells(i, 2).Value = float(mem)
-            else:
-                blanks.append(sku)
-
-        # Insert 'Recommended Memory' column right after RECOMMENDED_COMPUTE_SKU
-        target_col = sku_col + 1
-        ws.Columns(target_col).Insert()
-        ws.Cells(1, target_col).Value = "Recommended Memory"
-        target_letter = _col_letter(target_col)
-
-        # Fill VLOOKUP formula for all data rows
-        if last_row >= 2:
-            formula = (
-                f"=IFERROR(VLOOKUP({sku_letter}2,'Azure SKUs'!A:B,2,FALSE),\"\")"
-            )
-            rng = ws.Range(f"{target_letter}2:{target_letter}{last_row}")
-            rng.Formula = formula  # Excel auto-fills relative references
-
-        excel.Calculate()
-        wb.Save()
-        log("    Azure SKUs sheet + Recommended Memory column updated")
-        if blanks:
-            log(f"    WARNING: {len(blanks)} SKU(s) have no memory value yet — fill them in the 'Azure SKUs' sheet:")
-            for s in blanks:
-                log(f"      - {s}")
-            log("    These rows will show as 0 in totals until you fill the values. Re-run the script after editing.")
-    finally:
-        if wb is not None:
-            wb.Close(False)
-        excel.Quit()
+    blanks = ensure_recommended_memory_openpyxl(lift_path)
+    log("    Azure SKUs sheet + Recommended Memory column updated")
+    if blanks:
+        log(f"    WARNING: {len(blanks)} SKU(s) have no memory value yet — fill them in the 'Azure SKUs' sheet:")
+        for s in blanks:
+            log(f"      - {s}")
+        log("    These rows will show as 0 in totals until you fill the values. Re-run the script after editing.")
 
 
 def read_excel_any(path: Path, sheet: str) -> pd.DataFrame:
@@ -625,11 +586,9 @@ def create_pie_image(path: Path, title: str, values: dict[str, int], colors: dic
     try:
         title_font = ImageFont.truetype("arialbd.ttf", 26 * scale)
         legend_font = ImageFont.truetype("arial.ttf", 19 * scale)
-        center_font = ImageFont.truetype("arialbd.ttf", 34 * scale)
     except Exception:
         title_font = ImageFont.load_default()
         legend_font = ImageFont.load_default()
-        center_font = ImageFont.load_default()
 
     def rgb(color: RGBColor):
         return (int(color[0]), int(color[1]), int(color[2]))
@@ -644,16 +603,25 @@ def create_pie_image(path: Path, title: str, values: dict[str, int], colors: dic
     radius = 112 * scale
     bbox = [cx - radius, cy - radius, cx + radius, cy + radius]
     total = sum(values.values()) or 1
+    extents = {label: (360 * value / total if value else 0) for label, value in values.items()}
+    min_visible = 7
+    excess = 0.0
+    for label, value in values.items():
+        if value and extents[label] < min_visible:
+            excess += min_visible - extents[label]
+            extents[label] = min_visible
+    for label in sorted(extents, key=extents.get, reverse=True):
+        if excess <= 0:
+            break
+        reducible = max(0, extents[label] - min_visible)
+        reduction = min(reducible, excess)
+        extents[label] -= reduction
+        excess -= reduction
     start = -90
     for label, value in values.items():
-        extent = 360 * value / total
+        extent = extents[label]
         draw.pieslice(bbox, start, start + extent, fill=rgb(colors[label]), outline=white, width=3 * scale)
         start += extent
-
-    total_text = f"{total:,}"
-    total_box = draw.textbbox((0, 0), total_text, font=center_font)
-    draw.text((cx - (total_box[2] - total_box[0]) / 2, cy - 20 * scale), total_text, fill=navy, font=center_font)
-    draw.text((cx - 42 * scale, cy + 18 * scale), "webapps", fill=gray, font=legend_font)
 
     legend_x = 345 * scale
     legend_y = 122 * scale
@@ -1446,7 +1414,7 @@ def add_webapp_readiness_slide(prs, m, output_dir: Path):
     add_panel(slide, 0.55, 1.12, 4.15, 2.55, "WebApp type distribution", title_size=13)
     pie_values = {web_type: int(webapp_by_type[web_type]["webapps"]) for web_type in web_types}
     pie_path = create_pie_image(output_dir / "webapp-type-distribution.png", "WebApp Types", pie_values, type_colors)
-    slide.shapes.add_picture(str(pie_path), Inches(0.72), Inches(1.48), Inches(3.80), Inches(2.02))
+    slide.shapes.add_picture(str(pie_path), Inches(0.82), Inches(1.38), Inches(3.25), Inches(2.25))
 
     add_panel(slide, 4.95, 1.12, 7.75, 2.55, "WebApps and hosting servers", title_size=13)
     count_rows = [["WebApp type", "WebApps", "Unique servers"]]
@@ -1916,28 +1884,26 @@ def build_deck(input_dir: Path, output: Path):
     log(f"  Web apps       : {m['web_total']:,}")
     log("Building slides...")
     prs = new_deck()
-    log("  [1/11] Title")
+    log("  [1/10] Title")
     add_title_slide(prs)
-    log("  [2/11] Consolidated Infrastructure Summary")
+    log("  [2/10] Consolidated Infrastructure Summary")
     add_consolidated_slide(prs, m)
-    log("  [3/11] Fileshare Readiness")
+    log("  [3/10] Fileshare Readiness")
     add_fileshare_readiness_slide(prs, m, output.parent)
-    log("  [4/11] VM Power State Summary")
+    log("  [4/10] VM Power State Summary")
     add_vm_power_slide(prs, m)
-    log("  [5/11] VM Utilization Summary")
+    log("  [5/10] VM Utilization Summary")
     add_vm_utilization_slide(prs, m)
-    log("  [6/11] Fileshares by Host OS Category")
+    log("  [6/10] Fileshares by Host OS Category")
     add_fileshare_os_slide(prs, m)
-    log("  [7/11] Database Resources by Type")
+    log("  [7/10] Database Resources by Type")
     add_db_slide(prs, m)
-    log("  [8/11] Non-SQL Database Readiness")
+    log("  [8/10] Non-SQL Database Readiness")
     add_non_sql_db_readiness_slide(prs, m)
-    log("  [9/11] SQL Readiness")
+    log("  [9/10] SQL Readiness")
     add_sql_readiness_slide(prs, m)
-    log("  [10/11] WebApp Readiness")
+    log("  [10/10] WebApp Readiness")
     add_webapp_readiness_slide(prs, m, output.parent)
-    log("  [11/11] Web Applications by Type")
-    add_webapp_slide(prs, m, output.parent)
     log("Saving deck...")
     # Write to a local temp file first, validate, then move to the final path.
     # This prevents PowerPoint/OneDrive from seeing a partially-written file
@@ -1975,6 +1941,7 @@ def build_deck(input_dir: Path, output: Path):
         except OSError:
             pass
     log(f"Done. Wrote {output}")
+    os.startfile(output)
 
 
 def main():
