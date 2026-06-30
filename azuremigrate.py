@@ -66,6 +66,11 @@ DB_RESOURCE_TYPES = {
     "microsoft.mysqldiscovery/mysqlsites/mysqlservers",
     "microsoft.offazure/mastersites/sqlsites/sqlservers",
 }
+NON_SQL_DB_RESOURCE_TYPES = {
+    "MongoDB": "microsoft.applicationmigration/mongosites/mongoinstances",
+    "MySQL": "microsoft.mysqldiscovery/mysqlsites/mysqlservers",
+    "PostgreSQL": "microsoft.applicationmigration/pgsqlsites/pgsqlinstances",
+}
 WEBAPP_RESOURCE_TYPES = {
     "microsoft.offazure/mastersites/webappsites/iiswebapplications",
     "microsoft.offazure/mastersites/webappsites/tomcatwebapplications",
@@ -759,6 +764,37 @@ def load_metrics(input_dir: Path):
     }
     db_total = sum(db_counts.values())
 
+    non_sql_db_discovery: dict[str, dict[str, object]] = {}
+    non_sql_support_statuses: set[str] = set()
+    all_non_sql = discovery[discovery["resourceType"].isin(NON_SQL_DB_RESOURCE_TYPES.values())].copy()
+    for db_type, resource_type in NON_SQL_DB_RESOURCE_TYPES.items():
+        db_rows = discovery[discovery["resourceType"].eq(resource_type)].copy()
+        parent_values = db_rows.get("parentResourceName", pd.Series(dtype=object))
+        version_values = db_rows.get("version", pd.Series(dtype=object)).fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+        support_values = db_rows.get("directSupportStatus", pd.Series(dtype=object)).fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+        support_counts = {str(k): int(v) for k, v in support_values.value_counts().to_dict().items()}
+        non_sql_support_statuses.update(support_counts)
+        non_sql_db_discovery[db_type] = {
+            "instances": int(len(db_rows)),
+            "servers": int(parent_values.dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique()),
+            "versions": int(version_values.nunique()),
+            "version_counts": {str(k): int(v) for k, v in version_values.value_counts().to_dict().items()},
+            "support_counts": support_counts,
+        }
+    all_non_sql_versions = all_non_sql.get("version", pd.Series(dtype=object)).fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+    all_non_sql_support = all_non_sql.get("directSupportStatus", pd.Series(dtype=object)).fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+    non_sql_support_total = {str(k): int(v) for k, v in all_non_sql_support.value_counts().to_dict().items()}
+    non_sql_support_statuses.update(non_sql_support_total)
+    non_sql_db_discovery["Total"] = {
+        "instances": int(len(all_non_sql)),
+        "servers": int(all_non_sql.get("parentResourceName", pd.Series(dtype=object)).dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique()),
+        "versions": int(all_non_sql_versions.nunique()),
+        "version_counts": {str(k): int(v) for k, v in all_non_sql_versions.value_counts().to_dict().items()},
+        "support_counts": non_sql_support_total,
+    }
+    non_sql_support_order = [s for s in ["Mainstream", "Extended", "OutOfSupport", "Unknown"] if s in non_sql_support_statuses]
+    non_sql_support_order += sorted(non_sql_support_statuses - set(non_sql_support_order))
+
     sql_rows = discovery[discovery["resourceType"].eq("microsoft.offazure/mastersites/sqlsites/sqlservers")]
     sql_instance_count = int(len(sql_rows))
     sql_server_count = int(sql_rows["parentResourceName"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique())
@@ -932,6 +968,8 @@ def load_metrics(input_dir: Path):
         "non_sql_db_counts": non_sql_db_counts,
         "non_sql_db_readiness": non_sql_db_readiness,
         "non_sql_db_readiness_total": non_sql_db_readiness_total,
+        "non_sql_db_discovery": non_sql_db_discovery,
+        "non_sql_support_order": non_sql_support_order,
         "onprem_storage_gb": onprem_storage_gb,
         "rec_storage_gb": rec_storage_gb,
         "onprem_cores": onprem_cores,
@@ -1125,13 +1163,14 @@ def add_non_sql_db_readiness_slide(prs, m):
     slide_title(
         slide,
         "Non-SQL Database Readiness",
-        "MongoDB, MySQL, and PostgreSQL readiness from Strategy_PaaS_Preferred.xlsx.",
+        "Discovery footprint, support status, and PaaS readiness for MongoDB, MySQL, and PostgreSQL.",
     )
 
-    counts = m["non_sql_db_counts"]
     readiness_by_type = m["non_sql_db_readiness"]
     readiness_total = m["non_sql_db_readiness_total"]
     total = m["non_sql_db_total"]
+    discovery_metrics = m["non_sql_db_discovery"]
+    support_order = m["non_sql_support_order"]
     db_types = ["MongoDB", "MySQL", "PostgreSQL"]
     readiness_order = ["Unknown", "Ready", "Ready With Conditions", "Not Ready"]
     readiness_colors = {
@@ -1141,10 +1180,93 @@ def add_non_sql_db_readiness_slide(prs, m):
         "Unknown": GREY,
     }
 
-    add_panel(slide, 0.70, 1.35, 11.95, 5.30, "Readiness by database type", title_size=17)
-
     def lighter(color, amount=0.78):
         return RGBColor(*(int(channel + (255 - channel) * amount) for channel in color))
+
+    def support_color(status):
+        lookup = {
+            "Mainstream": GREEN,
+            "Extended": YELLOW,
+            "OutOfSupport": RED,
+            "Unknown": GREY,
+        }
+        return lookup.get(status, TEAL)
+
+    add_panel(slide, 0.65, 1.20, 5.80, 1.95, "Discovery footprint", title_size=14)
+    metric_headers = ["Instances", "Servers", "Versions"]
+    metric_keys = ["instances", "servers", "versions"]
+    metric_x = 2.35
+    metric_y = 1.72
+    metric_cell_w = 1.18
+    metric_cell_h = 0.25
+    metric_gap = 0.05
+    for i, header in enumerate(metric_headers):
+        x = metric_x + i * (metric_cell_w + metric_gap)
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(metric_y), Inches(metric_cell_w), Inches(metric_cell_h))
+        rect.fill.solid(); rect.fill.fore_color.rgb = NAVY; rect.line.fill.background()
+        add_text(slide, header, x + 0.06, metric_y + 0.04, metric_cell_w - 0.12, 0.16, 9, WHITE, True, align=PP_ALIGN.CENTER)
+    for r, row_label in enumerate(db_types + ["Total"]):
+        y = metric_y + (r + 1) * (metric_cell_h + metric_gap)
+        add_text(slide, row_label, 0.90, y + 0.04, 1.18, 0.18, 10, NAVY, True)
+        row = discovery_metrics[row_label]
+        for c, key in enumerate(metric_keys):
+            x = metric_x + c * (metric_cell_w + metric_gap)
+            rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(metric_cell_w), Inches(metric_cell_h))
+            rect.fill.solid(); rect.fill.fore_color.rgb = NAVY if row_label == "Total" else ALT
+            rect.line.color.rgb = WHITE; rect.line.width = Pt(1)
+            add_text(
+                slide,
+                f"{row[key]:,}",
+                x + 0.06,
+                y + 0.04,
+                metric_cell_w - 0.12,
+                0.15,
+                9,
+                WHITE if row_label == "Total" else NAVY,
+                True,
+                align=PP_ALIGN.CENTER,
+            )
+
+    add_panel(slide, 6.75, 1.20, 5.90, 1.95, "Support status by database type", title_size=14)
+    support_cols = support_order or ["Unknown"]
+    support_x = 8.20
+    support_y = 1.72
+    support_grid_w = 4.05
+    support_cell_w = support_grid_w / len(support_cols)
+    support_cell_h = 0.25
+    support_row_gap = 0.05
+    support_col_gap = 0.04
+    for i, status in enumerate(support_cols):
+        x = support_x + i * support_cell_w
+        color = support_color(status)
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(support_y), Inches(support_cell_w - support_col_gap), Inches(support_cell_h))
+        rect.fill.solid(); rect.fill.fore_color.rgb = color; rect.line.fill.background()
+        add_text(
+            slide,
+            status.replace("OutOfSupport", "Out of support"),
+            x + 0.05,
+            support_y + 0.05,
+            support_cell_w - support_col_gap - 0.10,
+            0.16,
+            9,
+            WHITE if status != "Extended" else NAVY,
+            True,
+            align=PP_ALIGN.CENTER,
+        )
+    for r, row_label in enumerate(db_types + ["Total"]):
+        y = support_y + (r + 1) * (support_cell_h + support_row_gap)
+        add_text(slide, row_label, 7.00, y + 0.04, 1.05, 0.18, 10, NAVY, True)
+        counts = discovery_metrics[row_label]["support_counts"]
+        for c, status in enumerate(support_cols):
+            x = support_x + c * support_cell_w
+            color = support_color(status) if row_label == "Total" else lighter(support_color(status))
+            rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(support_cell_w - support_col_gap), Inches(support_cell_h))
+            rect.fill.solid(); rect.fill.fore_color.rgb = color
+            rect.line.color.rgb = WHITE; rect.line.width = Pt(1)
+            text_color = WHITE if row_label == "Total" and status != "Extended" else NAVY
+            add_text(slide, f"{counts.get(status, 0):,}", x + 0.05, y + 0.04, support_cell_w - support_col_gap - 0.10, 0.15, 9, text_color, True, align=PP_ALIGN.CENTER)
+
+    add_panel(slide, 0.65, 3.45, 12.00, 3.05, "PaaS readiness by database type", title_size=14)
 
     status_labels = {
         "Unknown": "Unknown",
@@ -1152,12 +1274,12 @@ def add_non_sql_db_readiness_slide(prs, m):
         "Ready With Conditions": "Ready w/ conditions",
         "Not Ready": "Not ready",
     }
-    label_x = 1.00
-    grid_x = 2.55
-    grid_y = 2.25
+    label_x = 0.95
+    grid_x = 2.35
+    grid_y = 4.02
     cell_w = 2.25
-    cell_h = 0.72
-    row_gap = 0.08
+    cell_h = 0.42
+    row_gap = 0.06
     col_gap = 0.08
 
     for i, status in enumerate(readiness_order):
@@ -1166,12 +1288,12 @@ def add_non_sql_db_readiness_slide(prs, m):
         rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(grid_y), Inches(cell_w), Inches(cell_h))
         rect.fill.solid(); rect.fill.fore_color.rgb = color; rect.line.fill.background()
         text_color = WHITE if status != "Ready With Conditions" else NAVY
-        add_text(slide, status_labels[status], x + 0.10, grid_y + 0.20, cell_w - 0.20, 0.25, 12, text_color, True, align=PP_ALIGN.CENTER)
+        add_text(slide, status_labels[status], x + 0.10, grid_y + 0.08, cell_w - 0.20, 0.24, 12, text_color, True, align=PP_ALIGN.CENTER)
 
     row_labels = db_types + ["Total"]
     for r, row_label in enumerate(row_labels):
         y = grid_y + (r + 1) * (cell_h + row_gap)
-        add_text(slide, row_label, label_x, y + 0.20, 1.25, 0.25, 12, NAVY, True)
+        add_text(slide, row_label, label_x, y + 0.05, 1.25, 0.30, 14, NAVY, True)
         row_counts = readiness_total if row_label == "Total" else readiness_by_type.get(row_label, {})
         for c, status in enumerate(readiness_order):
             x = grid_x + c * (cell_w + col_gap)
@@ -1182,23 +1304,12 @@ def add_non_sql_db_readiness_slide(prs, m):
             rect.line.width = Pt(1)
             value = row_counts.get(status, 0)
             text_color = WHITE if row_label == "Total" and status != "Ready With Conditions" else NAVY
-            add_text(slide, f"{value:,}", x + 0.10, y + 0.18, cell_w - 0.20, 0.28, 16, text_color, True, align=PP_ALIGN.CENTER)
+            add_text(slide, f"{value:,}", x + 0.10, y + 0.09, cell_w - 0.20, 0.18, 11, text_color, True, align=PP_ALIGN.CENTER)
 
-    add_text(
-        slide,
-        f"Total non-SQL database rows assessed: {total:,}",
-        1.00,
-        6.05,
-        4.75,
-        0.25,
-        11,
-        SLATE,
-        True,
-    )
     add_source(
         slide,
-        "Source: Strategy_PaaS_Preferred.xlsx sheets Mongo_to_Azure_Document_DB, MySQL_to_AzureFlexServerMySQL, and PgSQL_to_AzureFlexServerPG.",
-        size=8,
+        "Sources: Discovery.xlsx Data sheet for instances, servers, versions, and directSupportStatus; Strategy_PaaS_Preferred.xlsx for PaaS readiness.",
+        size=7,
     )
 
 
