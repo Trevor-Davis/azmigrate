@@ -75,6 +75,10 @@ WEBAPP_RESOURCE_TYPES = {
     "microsoft.offazure/mastersites/webappsites/iiswebapplications",
     "microsoft.offazure/mastersites/webappsites/tomcatwebapplications",
 }
+WEBAPP_RESOURCE_TYPE_LABELS = {
+    "IIS": "microsoft.offazure/mastersites/webappsites/iiswebapplications",
+    "Tomcat": "microsoft.offazure/mastersites/webappsites/tomcatwebapplications",
+}
 FILESHARE_RESOURCE_TYPE = "microsoft.applicationmigration/storagesites/fileshares"
 MACHINE_RESOURCE_TYPE = "microsoft.offazure/vmwaresites/machines"
 
@@ -614,6 +618,56 @@ def create_donut_image(path: Path, smb: int, nfs: int, title="Protocol Distribut
     return path
 
 
+def create_pie_image(path: Path, title: str, values: dict[str, int], colors: dict[str, RGBColor]):
+    width, height, scale = 520, 360, 4
+    img = Image.new("RGB", (width * scale, height * scale), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    try:
+        title_font = ImageFont.truetype("arialbd.ttf", 26 * scale)
+        legend_font = ImageFont.truetype("arial.ttf", 19 * scale)
+        center_font = ImageFont.truetype("arialbd.ttf", 34 * scale)
+    except Exception:
+        title_font = ImageFont.load_default()
+        legend_font = ImageFont.load_default()
+        center_font = ImageFont.load_default()
+
+    def rgb(color: RGBColor):
+        return (int(color[0]), int(color[1]), int(color[2]))
+
+    navy = rgb(NAVY)
+    gray = rgb(SLATE)
+    white = (255, 255, 255)
+    title_box = draw.textbbox((0, 0), title, font=title_font)
+    draw.text(((width * scale - (title_box[2] - title_box[0])) / 2, 8 * scale), title, fill=navy, font=title_font)
+
+    cx, cy = 190 * scale, 180 * scale
+    radius = 112 * scale
+    bbox = [cx - radius, cy - radius, cx + radius, cy + radius]
+    total = sum(values.values()) or 1
+    start = -90
+    for label, value in values.items():
+        extent = 360 * value / total
+        draw.pieslice(bbox, start, start + extent, fill=rgb(colors[label]), outline=white, width=3 * scale)
+        start += extent
+
+    total_text = f"{total:,}"
+    total_box = draw.textbbox((0, 0), total_text, font=center_font)
+    draw.text((cx - (total_box[2] - total_box[0]) / 2, cy - 20 * scale), total_text, fill=navy, font=center_font)
+    draw.text((cx - 42 * scale, cy + 18 * scale), "webapps", fill=gray, font=legend_font)
+
+    legend_x = 345 * scale
+    legend_y = 122 * scale
+    box = 13 * scale
+    for i, (label, value) in enumerate(values.items()):
+        y = legend_y + i * 48 * scale
+        draw.rectangle([legend_x, y, legend_x + box, y + box], fill=rgb(colors[label]), outline=white, width=2 * scale)
+        draw.text((legend_x + box + 10 * scale, y - 6 * scale), f"{label} ({value:,})", fill=gray, font=legend_font)
+
+    img = img.resize((width, height), Image.Resampling.LANCZOS)
+    img.save(path)
+    return path
+
+
 def create_readiness_image(path: Path, readiness_counts: dict[str, int]):
     categories = ["Unknown", "Ready With Conditions", "Not Ready", "Ready"]
     values = [int(readiness_counts.get(category, 0)) for category in categories]
@@ -705,6 +759,7 @@ def load_metrics(input_dir: Path):
     mongo_df = _read_optional(paas_path, "Mongo_to_Azure_Document_DB")
     mysql_df = _read_optional(paas_path, "MySQL_to_AzureFlexServerMySQL")
     pgsql_df = _read_optional(paas_path, "PgSQL_to_AzureFlexServerPG")
+    webapp_df = _read_optional(paas_path, "WebApp_to_AKS")
 
     require_columns(discovery, "Discovery.xlsx/Data", ["resourceType", "parentResourceName"])
     require_columns(
@@ -900,6 +955,43 @@ def load_metrics(input_dir: Path):
         "Tomcat Web Applications": int(discovery["resourceType"].eq("microsoft.offazure/mastersites/webappsites/tomcatwebapplications").sum()),
     }
     web_total = sum(web_counts.values())
+    webapp_discovery = discovery[discovery["resourceType"].isin(WEBAPP_RESOURCE_TYPE_LABELS.values())].copy()
+    webapp_by_type: dict[str, dict[str, object]] = {}
+    webapp_support_statuses: set[str] = set()
+    for web_type, resource_type in WEBAPP_RESOURCE_TYPE_LABELS.items():
+        rows = webapp_discovery[webapp_discovery["resourceType"].eq(resource_type)]
+        parent_values = rows.get("parentResourceName", pd.Series(dtype=object))
+        support_values = rows.get("directSupportStatus", pd.Series(dtype=object)).fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+        support_counts = {str(k): int(v) for k, v in support_values.value_counts().to_dict().items()}
+        webapp_support_statuses.update(support_counts)
+        webapp_by_type[web_type] = {
+            "webapps": int(len(rows)),
+            "servers": int(parent_values.dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique()),
+            "support_counts": support_counts,
+        }
+    all_webapp_support = webapp_discovery.get("directSupportStatus", pd.Series(dtype=object)).fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+    webapp_support_total = {str(k): int(v) for k, v in all_webapp_support.value_counts().to_dict().items()}
+    webapp_support_statuses.update(webapp_support_total)
+    webapp_by_type["Total"] = {
+        "webapps": int(len(webapp_discovery)),
+        "servers": int(webapp_discovery.get("parentResourceName", pd.Series(dtype=object)).dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique()),
+        "support_counts": webapp_support_total,
+    }
+    webapp_support_order = [s for s in ["Mainstream", "Extended", "OutOfSupport", "Unknown"] if s in webapp_support_statuses]
+    webapp_support_order += sorted(webapp_support_statuses - set(webapp_support_order))
+
+    webapp_readiness_by_type: dict[str, dict[str, int]] = {}
+    webapp_readiness_total = {k: 0 for k in READINESS_ORDER}
+    if webapp_df is not None and {"WEBAPPTYPE", "READINESS"}.issubset(webapp_df.columns):
+        web_type_values = webapp_df["WEBAPPTYPE"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+        for web_type in WEBAPP_RESOURCE_TYPE_LABELS:
+            counts, _total = _readiness_counts(webapp_df[web_type_values.str.lower().eq(web_type.lower())], "READINESS")
+            webapp_readiness_by_type[web_type] = counts
+            for key, value in counts.items():
+                webapp_readiness_total[key] += value
+    else:
+        for web_type in WEBAPP_RESOURCE_TYPE_LABELS:
+            webapp_readiness_by_type[web_type] = {k: 0 for k in READINESS_ORDER}
 
     onprem_storage_gb = pd.to_numeric(lift["ONPREM_STORAGE_GB"], errors="coerce").fillna(0).sum()
     rec_storage_gb = pd.to_numeric(lift["RECOMMENDED_STORAGE_SIZE_GB"], errors="coerce").fillna(0).sum()
@@ -952,6 +1044,10 @@ def load_metrics(input_dir: Path):
         "db_total": db_total,
         "web_counts": web_counts,
         "web_total": web_total,
+        "webapp_by_type": webapp_by_type,
+        "webapp_support_order": webapp_support_order,
+        "webapp_readiness_by_type": webapp_readiness_by_type,
+        "webapp_readiness_total": webapp_readiness_total,
         "sql_instance_count": sql_instance_count,
         "sql_server_count": sql_server_count,
         "sql_versions": sql_versions,
@@ -1309,6 +1405,100 @@ def add_non_sql_db_readiness_slide(prs, m):
     add_source(
         slide,
         "Sources: Discovery.xlsx Data sheet for instances, servers, versions, and directSupportStatus; Strategy_PaaS_Preferred.xlsx for PaaS readiness.",
+        size=7,
+    )
+
+
+def add_webapp_readiness_slide(prs, m, output_dir: Path):
+    slide = blank_slide(prs)
+    slide_title(
+        slide,
+        "WebApp Readiness",
+        "Discovery web application footprint, support status, and AKS readiness by web app type.",
+    )
+
+    web_types = ["IIS", "Tomcat"]
+    webapp_by_type = m["webapp_by_type"]
+    support_order = m["webapp_support_order"] or ["Unknown"]
+    readiness_by_type = m["webapp_readiness_by_type"]
+    readiness_total = m["webapp_readiness_total"]
+    readiness_order = ["Unknown", "Ready", "Ready With Conditions", "Not Ready"]
+    type_colors = {"IIS": TEAL, "Tomcat": ORANGE}
+    support_colors = {
+        "Mainstream": GREEN,
+        "Extended": YELLOW,
+        "OutOfSupport": RED,
+        "Unknown": GREY,
+    }
+    readiness_colors = {
+        "Ready": GREEN,
+        "Ready With Conditions": YELLOW,
+        "Not Ready": RED,
+        "Unknown": GREY,
+    }
+
+    def lighter(color, amount=0.78):
+        return RGBColor(*(int(channel + (255 - channel) * amount) for channel in color))
+
+    def status_label(status):
+        return status.replace("Ready With Conditions", "Ready w/ conditions").replace("OutOfSupport", "Out of support")
+
+    add_panel(slide, 0.55, 1.12, 4.15, 2.55, "WebApp type distribution", title_size=13)
+    pie_values = {web_type: int(webapp_by_type[web_type]["webapps"]) for web_type in web_types}
+    pie_path = create_pie_image(output_dir / "webapp-type-distribution.png", "WebApp Types", pie_values, type_colors)
+    slide.shapes.add_picture(str(pie_path), Inches(0.72), Inches(1.48), Inches(3.80), Inches(2.02))
+
+    add_panel(slide, 4.95, 1.12, 7.75, 2.55, "WebApps and hosting servers", title_size=13)
+    count_rows = [["WebApp type", "WebApps", "Unique servers"]]
+    for web_type in web_types:
+        row = webapp_by_type[web_type]
+        count_rows.append([web_type, f"{row['webapps']:,}", f"{row['servers']:,}"])
+    row = webapp_by_type["Total"]
+    count_rows.append(["Total", f"{row['webapps']:,}", f"{row['servers']:,}"])
+    add_table(slide, count_rows, 5.22, 1.78, 7.10, 1.35, 11, col_widths=[2.85, 2.05, 2.20])
+
+    def draw_stacked_matrix(panel_x, panel_y, panel_w, title, columns, row_values, colors):
+        add_panel(slide, panel_x, panel_y, panel_w, 2.52, title, title_size=13)
+        label_x = panel_x + 0.22
+        grid_x = panel_x + 1.38
+        grid_y = panel_y + 0.65
+        grid_w = panel_w - 1.70
+        cell_h = 0.34
+        row_gap = 0.08
+        col_gap = 0.05
+        cell_w = grid_w / len(columns)
+        for i, col in enumerate(columns):
+            x = grid_x + i * cell_w
+            color = colors.get(col, TEAL)
+            rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(grid_y), Inches(cell_w - col_gap), Inches(cell_h))
+            rect.fill.solid(); rect.fill.fore_color.rgb = color; rect.line.fill.background()
+            text_color = WHITE if col not in {"Extended", "Ready With Conditions"} else NAVY
+            add_text(slide, status_label(col), x + 0.04, grid_y + 0.08, cell_w - col_gap - 0.08, 0.17, 7, text_color, True, align=PP_ALIGN.CENTER)
+        row_labels = web_types + ["Total"]
+        for r, row_label in enumerate(row_labels):
+            y = grid_y + (r + 1) * (cell_h + row_gap)
+            add_text(slide, row_label, label_x, y + 0.08, 0.95, 0.17, 9, NAVY, True)
+            values = row_values["Total"] if row_label == "Total" else row_values.get(row_label, {})
+            for c, col in enumerate(columns):
+                x = grid_x + c * cell_w
+                color = colors.get(col, TEAL) if row_label == "Total" else lighter(colors.get(col, TEAL))
+                rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(cell_w - col_gap), Inches(cell_h))
+                rect.fill.solid(); rect.fill.fore_color.rgb = color
+                rect.line.color.rgb = WHITE; rect.line.width = Pt(1)
+                text_color = WHITE if row_label == "Total" and col not in {"Extended", "Ready With Conditions"} else NAVY
+                add_text(slide, f"{values.get(col, 0):,}", x + 0.04, y + 0.08, cell_w - col_gap - 0.08, 0.17, 9, text_color, True, align=PP_ALIGN.CENTER)
+
+    support_rows = {web_type: webapp_by_type[web_type]["support_counts"] for web_type in web_types}
+    support_rows["Total"] = webapp_by_type["Total"]["support_counts"]
+    draw_stacked_matrix(0.55, 4.02, 5.95, "directSupportStatus by type", support_order, support_rows, support_colors)
+
+    readiness_rows = {web_type: readiness_by_type.get(web_type, {}) for web_type in web_types}
+    readiness_rows["Total"] = readiness_total
+    draw_stacked_matrix(6.75, 4.02, 5.95, "AKS readiness by type", readiness_order, readiness_rows, readiness_colors)
+
+    add_source(
+        slide,
+        "Sources: Discovery.xlsx Data sheet for resourceType, parentResourceName, and directSupportStatus; Strategy_PaaS_Preferred.xlsx WebApp_to_AKS for READINESS.",
         size=7,
     )
 
@@ -1693,25 +1883,27 @@ def build_deck(input_dir: Path, output: Path):
     log(f"  Web apps       : {m['web_total']:,}")
     log("Building slides...")
     prs = new_deck()
-    log("  [1/10] Title")
+    log("  [1/11] Title")
     add_title_slide(prs)
-    log("  [2/10] Consolidated Infrastructure Summary")
+    log("  [2/11] Consolidated Infrastructure Summary")
     add_consolidated_slide(prs, m)
-    log("  [3/10] Fileshare Readiness")
+    log("  [3/11] Fileshare Readiness")
     add_fileshare_readiness_slide(prs, m, output.parent)
-    log("  [4/10] VM Power State Summary")
+    log("  [4/11] VM Power State Summary")
     add_vm_power_slide(prs, m)
-    log("  [5/10] VM Utilization Summary")
+    log("  [5/11] VM Utilization Summary")
     add_vm_utilization_slide(prs, m)
-    log("  [6/10] Fileshares by Host OS Category")
+    log("  [6/11] Fileshares by Host OS Category")
     add_fileshare_os_slide(prs, m)
-    log("  [7/10] Database Resources by Type")
+    log("  [7/11] Database Resources by Type")
     add_db_slide(prs, m)
-    log("  [8/10] Non-SQL Database Readiness")
+    log("  [8/11] Non-SQL Database Readiness")
     add_non_sql_db_readiness_slide(prs, m)
-    log("  [9/10] SQL Readiness")
+    log("  [9/11] SQL Readiness")
     add_sql_readiness_slide(prs, m)
-    log("  [10/10] Web Applications by Type")
+    log("  [10/11] WebApp Readiness")
+    add_webapp_readiness_slide(prs, m, output.parent)
+    log("  [11/11] Web Applications by Type")
     add_webapp_slide(prs, m)
     log("Saving deck...")
     # Write to a local temp file first, validate, then move to the final path.
