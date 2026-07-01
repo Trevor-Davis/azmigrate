@@ -14,6 +14,8 @@ You pay for:
 
 SQL Server licensing is already included in the price. No existing SQL licenses required.
 
+RULE: when SQL MI is used, don't count any licenses.
+
 ### 2. Azure Hybrid Benefit (AHB)
 
 If the customer has:
@@ -36,7 +38,8 @@ These are the important rules when you're looking at an Azure Migrate assessment
 
 Enterprise customers receive the 4:1 virtualization benefit when targeting General Purpose.
 
-### Example
+RULE: 1 Standard core converts to 1 core in Azure
+RULE: 1 Enterprise core converts to 4 vCores in Azure
 
 Customer owns:
 
