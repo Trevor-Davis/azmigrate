@@ -813,6 +813,43 @@ def discovery_sets(discovery: pd.DataFrame):
     return files, web, db
 
 
+def load_sql_license_counts(input_dir: Path) -> dict:
+    """Read SQL Enterprise / Standard (Server Edition) workbooks and total the
+    '[A] # Licenses' column, excluding the summary 'Total' row. Cores are
+    reported as 2 x licenses per the customer's Server+CAL licensing model.
+    Returns {'enterprise': {'licenses': N, 'cores': N*2}, 'standard': {...}}.
+    Missing files or read errors are logged and yield zeroed entries.
+    """
+    result = {"enterprise": {"licenses": 0, "cores": 0},
+              "standard":   {"licenses": 0, "cores": 0}}
+    edition_files = {
+        "enterprise": input_dir / "SQL Enterprise (Server Edition).xlsx",
+        "standard":   input_dir / "SQL Standard (Server Edition).xlsx",
+    }
+    for edition, path in edition_files.items():
+        if not path.exists():
+            log(f"  WARNING: {path.name} not found; skipping {edition} license count.")
+            continue
+        try:
+            df = read_excel_any(path, "Export")
+        except Exception as exc:
+            log(f"  WARNING: could not read {path.name} ({exc}); skipping {edition} license count.")
+            continue
+        col_candidates = [c for c in df.columns if "# Licenses" in str(c) or "Licenses" == str(c).strip()]
+        if not col_candidates:
+            log(f"  WARNING: '# Licenses' column not found in {path.name}; columns: {list(df.columns)}")
+            continue
+        licenses_col = col_candidates[0]
+        # exclude summary 'Total' row (Agreement Number == 'Total')
+        agree_col = df.columns[0]
+        mask = df[agree_col].astype(str).str.strip().str.lower() != "total"
+        licenses = pd.to_numeric(df.loc[mask, licenses_col], errors="coerce").fillna(0).sum()
+        licenses_int = int(licenses)
+        result[edition] = {"licenses": licenses_int, "cores": licenses_int * 2}
+        log(f"  {path.name}: {licenses_int:,} licenses ({licenses_int * 2:,} cores)")
+    return result
+
+
 def load_metrics(input_dir: Path):
     discovery_path = input_dir / "Discovery.xlsx"
     lift_path = input_dir / "Strategy_Lift_and_shift.xlsx"
@@ -1178,6 +1215,7 @@ def load_metrics(input_dir: Path):
         "non_sql_db_counts": non_sql_db_counts,
         "non_sql_db_readiness": non_sql_db_readiness,
         "non_sql_db_readiness_total": non_sql_db_readiness_total,
+        "sql_licensing": load_sql_license_counts(input_dir),
         "non_sql_db_discovery": non_sql_db_discovery,
         "non_sql_support_order": non_sql_support_order,
         "onprem_storage_gb": onprem_storage_gb,
@@ -1819,44 +1857,35 @@ def add_sql_cost_licensing_slide(prs, m):
     yearly_savings = yearly_lift - yearly_hybrid  # positive => MI saves money
     savings_color = GREEN if yearly_savings >= 0 else RED
 
-    # --- SQL Server versions owned (above the cost panel) ---
-    versions = m.get("sql_versions") or []
-    # aggregate counts by version label (versions list is (version, status, count))
-    version_totals: dict[str, int] = {}
-    for entry in versions:
-        try:
-            ver, _status, count = entry
-        except (TypeError, ValueError):
-            continue
-        label = str(ver).strip() or "Unknown"
-        try:
-            version_totals[label] = version_totals.get(label, 0) + int(count)
-        except (TypeError, ValueError):
-            continue
-    ordered_versions = sorted(version_totals.items(), key=lambda kv: (-kv[1], kv[0]))
+    # --- SQL Server Licenses & Cores owned (top strip, compact) ---
+    licensing = m.get("sql_licensing") or {}
+    ent = licensing.get("enterprise", {"licenses": 0, "cores": 0})
+    std = licensing.get("standard",   {"licenses": 0, "cores": 0})
 
     owned_panel_y = 1.15
-    owned_panel_h = 1.00
-    add_panel(slide, 0.55, owned_panel_y, 12.30, owned_panel_h, "SQL Server versions — quantity owned", title_size=12)
+    owned_panel_h = 1.05
+    add_panel(slide, 0.55, owned_panel_y, 12.30, owned_panel_h, "SQL Server licenses owned (from EA export)", title_size=11)
 
-    if not ordered_versions:
-        add_text(slide, "No SQL version data available in Discovery.xlsx.",
-                 0.75, owned_panel_y + 0.45, 12.0, 0.3, 10, MUTED)
-    else:
-        max_chips = 10
-        chips = ordered_versions[:max_chips]
-        gap = 0.12
-        chip_area_w = 12.30 - 0.30
-        chip_w = (chip_area_w - gap * (len(chips) - 1)) / max(len(chips), 1)
-        chip_h = 0.44
-        chip_y = owned_panel_y + 0.45
-        for i, (label, count) in enumerate(chips):
-            x = 0.70 + i * (chip_w + gap)
-            rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(chip_y), Inches(chip_w), Inches(chip_h))
-            rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
-            rect.line.color.rgb = LINE; rect.line.width = Pt(1)
-            add_text(slide, f"{count:,}", x + 0.05, chip_y + 0.02, chip_w - 0.10, 0.22, 14, NAVY, True, align=PP_ALIGN.CENTER)
-            add_text(slide, label,        x + 0.05, chip_y + 0.24, chip_w - 0.10, 0.20, 8,  MUTED, False, align=PP_ALIGN.CENTER)
+    lic_inner_y = owned_panel_y + 0.42
+    lic_inner_h = owned_panel_h - 0.50
+    lic_gap = 0.20
+    lic_w = (12.30 - 0.30 - lic_gap) / 2
+
+    def license_card(x, accent, edition, licenses, cores):
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(lic_inner_y), Inches(lic_w), Inches(lic_inner_h))
+        rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
+        rect.line.color.rgb = LINE; rect.line.width = Pt(1)
+        bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(lic_inner_y), Inches(0.06), Inches(lic_inner_h))
+        bar.fill.solid(); bar.fill.fore_color.rgb = accent; bar.line.fill.background()
+        # single-row layout: edition | Licenses N | Cores N
+        add_text(slide, edition, x + 0.20, lic_inner_y + 0.13, lic_w * 0.45, 0.30, 12, NAVY, True)
+        metrics_x = x + lic_w * 0.48
+        metric_w = (lic_w - (lic_w * 0.48) - 0.15) / 2
+        add_text(slide, f"Licenses: {licenses:,}", metrics_x,               lic_inner_y + 0.13, metric_w, 0.30, 13, NAVY, True, align=PP_ALIGN.CENTER)
+        add_text(slide, f"Cores: {cores:,}",       metrics_x + metric_w,    lic_inner_y + 0.13, metric_w, 0.30, 13, NAVY, True, align=PP_ALIGN.CENTER)
+
+    license_card(0.70,                    NAVY, "SQL Server Enterprise", ent.get("licenses", 0), ent.get("cores", 0))
+    license_card(0.70 + lic_w + lic_gap,  TEAL, "SQL Server Standard",   std.get("licenses", 0), std.get("cores", 0))
 
     # --- Cost comparison cards ---
     cost_panel_y = owned_panel_y + owned_panel_h + 0.20
