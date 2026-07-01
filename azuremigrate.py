@@ -29,6 +29,7 @@ import re
 import shutil
 import tempfile
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -372,7 +373,12 @@ def ensure_recommended_memory(lift_path: Path) -> None:
     Excel process is busy.
     """
     log(f"  Updating {lift_path.name}: Azure SKUs sheet + Recommended Memory column")
-    blanks = ensure_recommended_memory_openpyxl(lift_path)
+    try:
+        blanks = ensure_recommended_memory_openpyxl(lift_path)
+    except zipfile.BadZipFile:
+        log("    WARNING: Workbook is not an Open XML .xlsx package; skipping persisted Azure SKUs update.")
+        log("    Recommended memory will be derived in memory for this deck run.")
+        return
     log("    Azure SKUs sheet + Recommended Memory column updated")
     if blanks:
         log(f"    WARNING: {len(blanks)} SKU(s) have no memory value yet — fill them in the 'Azure SKUs' sheet:")
@@ -821,6 +827,20 @@ def load_metrics(input_dir: Path):
     sql_rows = discovery[discovery["resourceType"].eq("microsoft.offazure/mastersites/sqlsites/sqlservers")]
     sql_instance_count = int(len(sql_rows))
     sql_server_count = int(sql_rows["parentResourceName"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique())
+    sql_resource_type = "microsoft.offazure/mastersites/sqlsites/sqlservers"
+    sql_parent_servers = set(sql_rows["parentResourceName"].dropna().map(norm_server)) - {""}
+    resource_types_by_server: dict[str, set[str]] = {}
+    for _, row in discovery.iterrows():
+        resource_type = str(row.get("resourceType", "")).strip()
+        server = norm_server(row.get("resourceName")) if resource_type == MACHINE_RESOURCE_TYPE else norm_server(row.get("parentResourceName"))
+        if server:
+            resource_types_by_server.setdefault(server, set()).add(resource_type)
+    sql_only_allowed_types = {MACHINE_RESOURCE_TYPE, sql_resource_type}
+    sql_only_server_count = sum(
+        1
+        for server in sql_parent_servers
+        if resource_types_by_server.get(server, set()).issubset(sql_only_allowed_types)
+    )
 
     # SQL version breakdown: count per (version, pssStatus). pssStatus drives bar color.
     if {"version", "pssStatus"}.issubset(sql_rows.columns):
@@ -924,17 +944,32 @@ def load_metrics(input_dir: Path):
     }
     web_total = sum(web_counts.values())
     webapp_discovery = discovery[discovery["resourceType"].isin(WEBAPP_RESOURCE_TYPE_LABELS.values())].copy()
+    resource_types_by_server: dict[str, set[str]] = {}
+    for _, row in discovery.iterrows():
+        resource_type = str(row.get("resourceType", "")).strip()
+        server = norm_server(row.get("resourceName")) if resource_type == MACHINE_RESOURCE_TYPE else norm_server(row.get("parentResourceName"))
+        if not server:
+            continue
+        resource_types_by_server.setdefault(server, set()).add(resource_type)
+    dedicated_allowed_types = set(WEBAPP_RESOURCE_TYPE_LABELS.values()) | {MACHINE_RESOURCE_TYPE}
     webapp_by_type: dict[str, dict[str, object]] = {}
     webapp_support_statuses: set[str] = set()
     for web_type, resource_type in WEBAPP_RESOURCE_TYPE_LABELS.items():
         rows = webapp_discovery[webapp_discovery["resourceType"].eq(resource_type)]
         parent_values = rows.get("parentResourceName", pd.Series(dtype=object))
+        server_names = set(parent_values.dropna().map(norm_server)) - {""}
+        dedicated_servers = {
+            server
+            for server in server_names
+            if resource_types_by_server.get(server, set()).issubset(dedicated_allowed_types)
+        }
         support_values = rows.get("directSupportStatus", pd.Series(dtype=object)).fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
         support_counts = {str(k): int(v) for k, v in support_values.value_counts().to_dict().items()}
         webapp_support_statuses.update(support_counts)
         webapp_by_type[web_type] = {
             "webapps": int(len(rows)),
-            "servers": int(parent_values.dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique()),
+            "servers": int(len(server_names)),
+            "dedicated_servers": int(len(dedicated_servers)),
             "support_counts": support_counts,
         }
     all_webapp_support = webapp_discovery.get("directSupportStatus", pd.Series(dtype=object)).fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
@@ -943,6 +978,11 @@ def load_metrics(input_dir: Path):
     webapp_by_type["Total"] = {
         "webapps": int(len(webapp_discovery)),
         "servers": int(webapp_discovery.get("parentResourceName", pd.Series(dtype=object)).dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique()),
+        "dedicated_servers": int(len({
+            server
+            for server in (set(webapp_discovery.get("parentResourceName", pd.Series(dtype=object)).dropna().map(norm_server)) - {""})
+            if resource_types_by_server.get(server, set()).issubset(dedicated_allowed_types)
+        })),
         "support_counts": webapp_support_total,
     }
     webapp_support_order = [s for s in ["Mainstream", "Extended", "OutOfSupport", "Unknown"] if s in webapp_support_statuses]
@@ -1018,6 +1058,7 @@ def load_metrics(input_dir: Path):
         "webapp_readiness_total": webapp_readiness_total,
         "sql_instance_count": sql_instance_count,
         "sql_server_count": sql_server_count,
+        "sql_only_server_count": sql_only_server_count,
         "sql_versions": sql_versions,
         "sql_vm_readiness": sql_vm_readiness,
         "sql_vm_total": sql_vm_total,
@@ -1413,22 +1454,22 @@ def add_webapp_readiness_slide(prs, m, output_dir: Path):
 
     add_panel(slide, 0.55, 1.12, 12.15, 2.55, "WebApps and hosting servers", title_size=13)
     label_x = 0.88
-    count_x = 3.25
+    count_x = 2.35
     count_y = 1.78
-    count_cell_w = 2.45
+    count_cell_w = 2.65
     count_cell_h = 0.34
     count_gap = 0.08
-    count_headers = [("WebApps", TEAL), ("Server Count", NAVY)]
+    count_headers = [("WebApps", TEAL), ("Server Count", NAVY), ("Dedicated WebApp Servers", MINT)]
     for i, (header, color) in enumerate(count_headers):
         x = count_x + i * (count_cell_w + count_gap)
         rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(count_y), Inches(count_cell_w), Inches(count_cell_h))
         rect.fill.solid(); rect.fill.fore_color.rgb = color; rect.line.fill.background()
-        add_text(slide, header, x + 0.10, count_y + 0.08, count_cell_w - 0.20, 0.18, 10, WHITE, True, align=PP_ALIGN.CENTER)
+        add_text(slide, header, x + 0.10, count_y + 0.07, count_cell_w - 0.20, 0.20, 9, WHITE, True, align=PP_ALIGN.CENTER)
     for r, row_label in enumerate([*web_types, "Total"]):
         y = count_y + (r + 1) * (count_cell_h + count_gap)
         add_text(slide, row_label, label_x, y + 0.08, 1.25, 0.18, 10, NAVY, True)
         row = webapp_by_type[row_label]
-        values = [row["webapps"], row["servers"]]
+        values = [row["webapps"], row["servers"], row["dedicated_servers"]]
         for c, value in enumerate(values):
             x = count_x + c * (count_cell_w + count_gap)
             rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(count_cell_w), Inches(count_cell_h))
@@ -1470,33 +1511,30 @@ def add_webapp_readiness_slide(prs, m, output_dir: Path):
     add_panel(slide, 0.55, 4.02, 5.95, 2.52, "Support Status", title_size=13)
     support_rows = {web_type: webapp_by_type[web_type]["support_counts"] for web_type in web_types}
     support_rows["Total"] = webapp_by_type["Total"]["support_counts"]
-    support_max = max([support_rows[row].get(status, 0) for row in web_types for status in support_order] + [1])
-    chart_left = 0.95
-    chart_top = 4.78
-    chart_bottom = 6.08
-    chart_h = chart_bottom - chart_top
-    group_w = 5.10 / len(support_order)
-    bar_w = 0.18
-    bar_gap = 0.07
-    for i, status in enumerate(support_order):
-        group_x = chart_left + i * group_w
-        pair_w = len(web_types) * bar_w + (len(web_types) - 1) * bar_gap
-        x0 = group_x + (group_w - pair_w) / 2
-        for j, web_type in enumerate(web_types):
-            value = support_rows[web_type].get(status, 0)
-            h = max(0.01, chart_h * safe_div(value, support_max))
-            x = x0 + j * (bar_w + bar_gap)
-            bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(chart_bottom - h), Inches(bar_w), Inches(h))
-            bar.fill.solid(); bar.fill.fore_color.rgb = type_colors[web_type]; bar.line.fill.background()
-            if value:
-                add_text(slide, f"{value:,}", x - 0.12, chart_bottom - h - 0.16, bar_w + 0.24, 0.13, 6, NAVY, True, align=PP_ALIGN.CENTER)
-        add_text(slide, status_label(status), group_x + 0.02, chart_bottom + 0.06, group_w - 0.04, 0.22, 7, SLATE, True, align=PP_ALIGN.CENTER)
-    legend_y = 4.42
-    for i, web_type in enumerate(web_types):
-        x = 0.85 + i * 1.05
-        sw = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(legend_y), Inches(0.12), Inches(0.10))
-        sw.fill.solid(); sw.fill.fore_color.rgb = type_colors[web_type]; sw.line.fill.background()
-        add_text(slide, web_type, x + 0.17, legend_y - 0.04, 0.70, 0.16, 7, SLATE, True)
+    support_table_rows = [[*web_types, "Total"]]
+    for status in support_order:
+        support_table_rows.append([
+            *[f"{support_rows[web_type].get(status, 0):,}" for web_type in web_types],
+            f"{support_rows['Total'].get(status, 0):,}",
+        ])
+    support_table = add_table(
+        slide,
+        support_table_rows,
+        2.35,
+        4.75,
+        3.70,
+        1.34,
+        10,
+        col_widths=[1.20, 1.20, 1.30],
+    )
+    label_x = 0.82
+    label_y = 4.75 + (1.34 / len(support_table_rows))
+    row_h = 1.34 / len(support_table_rows)
+    for idx, status in enumerate(support_order):
+        y = label_y + idx * row_h
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(label_x), Inches(y), Inches(1.35), Inches(row_h - 0.03))
+        rect.fill.solid(); rect.fill.fore_color.rgb = support_colors.get(status, TEAL); rect.line.fill.background()
+        add_text(slide, status_label(status), label_x + 0.08, y + 0.08, 1.19, 0.16, 8, WHITE if status != "Extended" else NAVY, True, align=PP_ALIGN.CENTER)
 
     readiness_rows = {web_type: readiness_by_type.get(web_type, {}) for web_type in web_types}
     readiness_rows["Total"] = readiness_total
@@ -1545,9 +1583,40 @@ def add_webapp_slide(prs, m, output_dir: Path):
 def add_consolidated_slide(prs, m):
     slide = blank_slide(prs)
     slide_title(slide, "Consolidated Infrastructure Summary")
+
+    def add_compact_matrix(x, y, row_label_w, col_widths, row_h, headers, rows, font_size=7, delta_color_col=None):
+        col_gap = 0.04
+        row_gap = 0.04
+        grid_x = x + row_label_w
+        for c, header in enumerate(headers):
+            cx = grid_x + sum(col_widths[:c]) + c * col_gap
+            cw = col_widths[c]
+            rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(cx), Inches(y), Inches(cw), Inches(row_h))
+            rect.fill.solid(); rect.fill.fore_color.rgb = NAVY; rect.line.fill.background()
+            add_text(slide, header, cx + 0.04, y + 0.05, cw - 0.08, row_h - 0.09, font_size, WHITE, True, align=PP_ALIGN.CENTER)
+        for r, (label, values, is_total) in enumerate(rows):
+            ry = y + (r + 1) * (row_h + row_gap)
+            add_text(slide, label, x, ry + 0.05, row_label_w - 0.08, row_h - 0.09, font_size, NAVY, True)
+            for c, value in enumerate(values):
+                if value == "":
+                    continue
+                cx = grid_x + sum(col_widths[:c]) + c * col_gap
+                cw = col_widths[c]
+                rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(cx), Inches(ry), Inches(cw), Inches(row_h))
+                rect.fill.solid(); rect.fill.fore_color.rgb = NAVY if is_total else ALT
+                rect.line.color.rgb = WHITE; rect.line.width = Pt(1)
+                text_color = WHITE if is_total else NAVY
+                if delta_color_col is not None and c == delta_color_col and not is_total:
+                    value_text = str(value).lower()
+                    if "increase" in value_text:
+                        text_color = RED
+                    elif "decrease" in value_text:
+                        text_color = GREEN
+                add_text(slide, str(value), cx + 0.04, ry + 0.05, cw - 0.08, row_h - 0.09, font_size, text_color, True, align=PP_ALIGN.CENTER)
+
     add_panel(slide, 0.4, 1.1, 2.6, 2.0, "VM Power State Chart", title_size=14)
     max_count = max(m["powered_on"], m["powered_off"], 1)
-    for i, (label, count, color) in enumerate([("Powered On", m["powered_on"], TEAL), ("Powered Off", m["powered_off"], PINK)]):
+    for i, (label, count, color) in enumerate([("Powered On", m["powered_on"], GREEN), ("Powered Off", m["powered_off"], RED)]):
         y = 1.6 + i * 0.66
         add_text(slide, label, 0.6, y, 1.0, 0.22, 8, SLATE, True)
         add_bar(slide, 1.55, y + 0.03, 1.1, 0.15, count, max_count, color)
@@ -1557,43 +1626,45 @@ def add_consolidated_slide(prs, m):
     storage_delta = delta_pct(m["rec_storage_gb"], m["onprem_storage_gb"])
     cores_delta = delta_pct(m["rec_cores"], m["onprem_cores"])
     mem_delta = delta_pct(m["rec_mem_gb"], m["onprem_mem_gb"])
-    rows = [
-        ["", "On-premises total", "On-premises Utilization", "Recommended Azure sizing"],
-        ["Assessed VMs", f"{m['vm_total']:,}", "", ""],
-        ["Storage", pb_from_gb(m["onprem_storage_gb"]), f"{m['storage_util']:.1f}% Consumed", f"{pb_from_gb(m['rec_storage_gb'])} ({delta_text(storage_delta)})"],
-        ["Cores", f"{m['onprem_cores']:,.0f}", f"{m['cpu_util']:.1f}% CPU Utilization", f"{m['rec_cores']:,.0f} ({delta_text(cores_delta)})"],
-        ["Memory", tb_from_gib(m["onprem_mem_gb"]), f"{m['mem_util']:.1f}% Memory Utilization", f"{tb_from_gib(m['rec_mem_gb'])} ({delta_text(mem_delta)})"],
+    vm_rows = [
+        ("Assessed VMs", [f"{m['vm_total']:,}", "", ""], False),
+        ("Storage", [pb_from_gb(m["onprem_storage_gb"]), f"{m['storage_util']:.1f}% Consumed", f"{pb_from_gb(m['rec_storage_gb'])} ({delta_text(storage_delta)})"], False),
+        ("Cores", [f"{m['onprem_cores']:,.0f}", f"{m['cpu_util']:.1f}% CPU Utilization", f"{m['rec_cores']:,.0f} ({delta_text(cores_delta)})"], False),
+        ("Memory", [tb_from_gib(m["onprem_mem_gb"]), f"{m['mem_util']:.1f}% Memory Utilization", f"{tb_from_gib(m['rec_mem_gb'])} ({delta_text(mem_delta)})"], False),
     ]
-    tbl_shape = add_table(slide, rows, 3.42, 1.56, 9.33, 1.25, 11, col_widths=[1.3, 2.1, 2.55, 3.05])
-    table = tbl_shape.table
-    for r in (2, 3, 4):
-        color_delta_text(table.cell(r, 3), table.cell(r, 3).text)
+    add_compact_matrix(
+        3.42,
+        1.56,
+        1.10,
+        [2.05, 2.50, 3.00],
+        0.26,
+        ["On-premises total", "On-premises utilization", "Recommended Azure sizing"],
+        vm_rows,
+        font_size=10,
+        delta_color_col=2,
+    )
 
     add_panel(slide, 0.4, 3.45, 3.9, 2.4, "Fileshare count by host OS", title_size=14)
     windows = m["os_counts"].get("Windows", 0)
     rhel = m["os_counts"].get("RHEL", 0)
     other = m["os_counts"].get("Other/Unknown", 0)
-    fs_rows = [["Host OS type", "OS category", "Fileshares", "Share"], ["Windows", "Windows", f"{windows:,}", pct(windows, m["fileshare_total"])]]
+    fs_rows = [("Windows", [f"{windows:,}", pct(windows, m["fileshare_total"])], False)]
     if rhel:
-        fs_rows.append(["Linux", "RHEL", f"{rhel:,}", pct(rhel, m["fileshare_total"])])
+        fs_rows.append(("Linux", [f"{rhel:,}", pct(rhel, m["fileshare_total"])], False))
     if other:
-        fs_rows.append(["Other", "Unknown", f"{other:,}", pct(other, m["fileshare_total"])])
-    fs_rows.append(["Total", "", f"{m['fileshare_total']:,}", "100.0%"])
-    add_table(slide, fs_rows, 0.55, 4.05, 3.6, 1.6, 11, col_widths=[1.1, 1.0, 0.85, 0.65])
+        fs_rows.append(("Other", [f"{other:,}", pct(other, m["fileshare_total"])], False))
+    fs_rows.append(("Total", [f"{m['fileshare_total']:,}", "100.0%"], True))
+    add_compact_matrix(0.55, 4.05, 1.10, [0.85, 0.65], 0.32, ["Fileshares", "Share"], fs_rows, font_size=10)
 
     add_panel(slide, 4.55, 3.45, 3.75, 2.4, "Database count by type", title_size=14)
-    db_rows = [["Database type", "Count", "Share"]]
-    for k, v in m["db_counts"].items():
-        db_rows.append([k, f"{v:,}", pct(v, m["db_total"])])
-    db_rows.append(["Total", f"{m['db_total']:,}", "100.0%"])
-    add_table(slide, db_rows, 4.7, 4.05, 3.45, 1.7, 11, col_widths=[1.85, 0.85, 0.75])
+    db_rows = [(k, [f"{v:,}", pct(v, m["db_total"])], False) for k, v in m["db_counts"].items()]
+    db_rows.append(("Total", [f"{m['db_total']:,}", "100.0%"], True))
+    add_compact_matrix(4.70, 4.05, 1.28, [0.72, 0.68], 0.25, ["Count", "Share"], db_rows, font_size=10)
 
     add_panel(slide, 8.7, 3.45, 3.85, 2.4, "Webapp count by type", title_size=14)
-    web_rows = [["Webapp type", "Webapp", "Share"]]
-    for k, v in m["web_counts"].items():
-        web_rows.append([k, f"{v:,}", pct(v, m["web_total"])])
-    web_rows.append(["Total", f"{m['web_total']:,}", "100.0%"])
-    add_table(slide, web_rows, 8.85, 4.05, 3.55, 1.6, 11, col_widths=[1.95, 0.85, 0.75])
+    web_rows = [(k.replace(" Web Applications", ""), [f"{v:,}", pct(v, m["web_total"])], False) for k, v in m["web_counts"].items()]
+    web_rows.append(("Total", [f"{m['web_total']:,}", "100.0%"], True))
+    add_compact_matrix(8.85, 4.05, 1.20, [0.72, 0.68], 0.36, ["Webapps", "Share"], web_rows, font_size=10)
 
 
 def add_fileshare_readiness_slide(prs, m, output_dir: Path):
@@ -1629,41 +1700,27 @@ def add_fileshare_readiness_slide(prs, m, output_dir: Path):
     )
 
 
-def add_sql_readiness_slide(prs, m):
+def add_sql_cost_licensing_slide(prs, m):
     slide = blank_slide(prs)
-    slide_title(slide, "SQL Readiness")
+    slide_title(slide, "SQL Cost and Licensing")
 
-    # KPI strip
-    def sql_kpi_card(x, value, label, accent):
-        w, h, y = 2.4, 0.60, 1.00
-        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
-        rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
-        rect.line.color.rgb = LINE; rect.line.width = Pt(1)
-        bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(0.05))
-        bar.fill.solid(); bar.fill.fore_color.rgb = accent; bar.line.fill.background()
-        add_text(slide, value, x + 0.12, y + 0.12, w - 0.24, 0.24, 18, NAVY, True)
-        add_text(slide, label, x + 0.12, y + 0.40, w - 0.24, 0.15, 8, SLATE, True)
-
-    sql_kpi_card(0.55, f"{m['sql_instance_count']:,}", "SQL Server Instances", TEAL)
-    sql_kpi_card(3.10, f"{m['sql_server_count']:,}", "Servers running SQL", MINT)
-    instances_per_server = m["sql_instance_count"] / m["sql_server_count"] if m["sql_server_count"] else 0
-    sql_kpi_card(5.65, f"{instances_per_server:.1f}", "Instances per server", TEAL)
-
-    # Cost comparison — compact panel with three inner cards
     lift_cost = float(m.get("sql_lift_total_cost", 0) or 0)
     hybrid_cost = float(m.get("sql_hybrid_cost", 0) or 0)
+    lift_vm_count = int(m.get("sql_server_count", 0) or 0)
+    hybrid_vm_count = int(m.get("sql_vm_total", 0) or 0)
+    hybrid_mi_count = int(m.get("sql_mi_total", 0) or 0)
     yearly_lift = lift_cost * 12
     yearly_hybrid = hybrid_cost * 12
     yearly_savings = yearly_lift - yearly_hybrid  # positive => MI saves money
     savings_color = GREEN if yearly_savings >= 0 else RED
 
-    cost_panel_y = 1.78
-    cost_panel_h = 1.05
+    cost_panel_y = 1.35
+    cost_panel_h = 1.65
     add_panel(slide, 0.55, cost_panel_y, 12.30, cost_panel_h, "Lift & Shift vs SQL MI (where ready) + Lift & Shift remainder", title_size=11)
 
-    inner_y = cost_panel_y + 0.35
-    inner_h = cost_panel_h - 0.45
-    gap = 0.15
+    inner_y = cost_panel_y + 0.50
+    inner_h = cost_panel_h - 0.65
+    gap = 0.20
     inner_w = (12.30 - 0.30 - gap * 2) / 3
 
     def cost_card(x, accent, headline, big_value, sub_text, value_color=None):
@@ -1672,28 +1729,26 @@ def add_sql_readiness_slide(prs, m):
         rect.line.color.rgb = LINE; rect.line.width = Pt(1)
         bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(inner_y), Inches(inner_w), Inches(0.05))
         bar.fill.solid(); bar.fill.fore_color.rgb = accent; bar.line.fill.background()
-        add_text(slide, headline, x + 0.16, inner_y + 0.08, inner_w - 0.32, 0.18, 9, NAVY, True)
-        add_text(slide, big_value, x + 0.16, inner_y + 0.27, inner_w - 0.32, 0.25, 17, value_color or NAVY, True)
-        add_text(slide, sub_text, x + 0.16, inner_y + 0.50, inner_w - 0.32, 0.14, 7, MUTED)
+        add_text(slide, headline, x + 0.18, inner_y + 0.14, inner_w - 0.36, 0.25, 12, NAVY, True)
+        add_text(slide, big_value, x + 0.18, inner_y + 0.44, inner_w - 0.36, 0.34, 24, value_color or NAVY, True)
+        add_text(slide, sub_text, x + 0.18, inner_y + 0.82, inner_w - 0.36, 0.20, 10, MUTED)
 
     x0 = 0.70
     cost_card(x0, RED, "100% Lift & Shift",
               money_k(lift_cost),
-              f"per month   /   {money_full(yearly_lift)}/yr")
+              f"{lift_vm_count:,} VMs / 0 SQL MI   |   {money_full(yearly_lift)}/yr")
     cost_card(x0 + inner_w + gap, TEAL, "SQL MI (where ready) + Lift & Shift",
               money_k(hybrid_cost),
-              f"per month   /   {money_full(yearly_hybrid)}/yr")
+              f"{hybrid_vm_count:,} VMs / {hybrid_mi_count:,} SQL MI   |   {money_full(yearly_hybrid)}/yr")
     cost_card(x0 + (inner_w + gap) * 2, savings_color, "Yearly Savings Using SQL MI",
               money_full(yearly_savings),
-              f"{money_full(yearly_savings / 12)} per month",
+              f"{hybrid_vm_count:,} VMs / {hybrid_mi_count:,} SQL MI   |   {money_full(yearly_savings / 12)}/mo",
               value_color=savings_color)
 
-    # Licensing snapshot (placeholder values — wire real data in once available)
-    lic_y = 2.98
-    lic_h = 1.10
+    lic_y = 3.55
+    lic_h = 2.00
     add_panel(slide, 0.55, lic_y, 12.30, lic_h, "SQL Server Licensing — owned vs. need", title_size=12)
 
-    # Random-ish placeholder values until real data is wired in
     licensing_rows = [
         ("SQL Server Standard",   m.get("sql_std_owned",  18), m.get("sql_std_needed",  24)),
         ("SQL Server Enterprise", m.get("sql_ent_owned",  12), m.get("sql_ent_needed",  8)),
@@ -1717,20 +1772,40 @@ def add_sql_readiness_slide(prs, m):
             owned_txt = str(owned)
             needed_txt = str(needed)
 
-        add_text(slide, edition, x + 0.18, lic_y + 0.43, w - 0.36, 0.20, 10, NAVY, True)
+        add_text(slide, edition, x + 0.22, lic_y + 0.56, w - 0.44, 0.28, 14, NAVY, True)
         col_w = (w - 0.36) / 3
-        cx = x + 0.18
-        row_y = lic_y + 0.64
-        add_text(slide, "Owned",    cx,                row_y,        col_w, 0.16, 8, MUTED)
-        add_text(slide, owned_txt,  cx,                row_y + 0.15, col_w, 0.22, 13, NAVY, True)
-        add_text(slide, "Need",     cx + col_w,        row_y,        col_w, 0.16, 8, MUTED)
-        add_text(slide, needed_txt, cx + col_w,        row_y + 0.15, col_w, 0.22, 13, NAVY, True)
-        add_text(slide, "Delta",    cx + col_w * 2,    row_y,        col_w, 0.16, 8, MUTED)
-        add_text(slide, delta_txt,  cx + col_w * 2,    row_y + 0.15, col_w, 0.22, 10, delta_color, True)
+        cx = x + 0.22
+        row_y = lic_y + 0.95
+        add_text(slide, "Owned",    cx,                row_y,        col_w, 0.20, 10, MUTED)
+        add_text(slide, owned_txt,  cx,                row_y + 0.24, col_w, 0.30, 18, NAVY, True)
+        add_text(slide, "Need",     cx + col_w,        row_y,        col_w, 0.20, 10, MUTED)
+        add_text(slide, needed_txt, cx + col_w,        row_y + 0.24, col_w, 0.30, 18, NAVY, True)
+        add_text(slide, "Delta",    cx + col_w * 2,    row_y,        col_w, 0.20, 10, MUTED)
+        add_text(slide, delta_txt,  cx + col_w * 2,    row_y + 0.24, col_w, 0.30, 13, delta_color, True)
 
     card_w = (12.30 - 0.30 - 0.15) / 2
     licensing_card(0.70,                       card_w, *licensing_rows[0])
     licensing_card(0.70 + card_w + 0.15,       card_w, *licensing_rows[1])
+
+
+def add_sql_readiness_slide(prs, m):
+    slide = blank_slide(prs)
+    slide_title(slide, "SQL Readiness")
+
+    # KPI strip
+    def sql_kpi_card(x, value, label, accent):
+        w, h, y = 2.4, 0.60, 1.00
+        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+        rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
+        rect.line.color.rgb = LINE; rect.line.width = Pt(1)
+        bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(0.05))
+        bar.fill.solid(); bar.fill.fore_color.rgb = accent; bar.line.fill.background()
+        add_text(slide, value, x + 0.12, y + 0.12, w - 0.24, 0.24, 18, NAVY, True)
+        add_text(slide, label, x + 0.12, y + 0.40, w - 0.24, 0.15, 8, SLATE, True)
+
+    sql_kpi_card(0.55, f"{m['sql_instance_count']:,}", "SQL Server Instances", TEAL)
+    sql_kpi_card(3.10, f"{m['sql_server_count']:,}", "Servers running SQL", MINT)
+    sql_kpi_card(5.65, f"{m['sql_only_server_count']:,}", "SQL-only servers", TEAL)
 
     # Versions chart (left)
     pss_colors = {
@@ -1739,8 +1814,8 @@ def add_sql_readiness_slide(prs, m):
         "OutOfSupport": RED,
         "Unknown":      GREY,
     }
-    versions_y = 4.25
-    versions_h = 2.35
+    versions_y = 2.05
+    versions_h = 4.55
     add_panel(slide, 0.55, versions_y, 6.4, versions_h, "SQL Server versions by support status", title_size=13)
     legend_y = versions_y + 0.40
     for i, (label, color) in enumerate([("Mainstream", GREEN), ("Extended", YELLOW), ("Out of support", RED), ("Unknown", GREY)]):
@@ -1797,6 +1872,12 @@ def add_sql_readiness_slide(prs, m):
     group_w = (chart_right - chart_left) / len(categories)
     bar_gap = 0.04
     bar_w = max(0.18, (group_w - 0.30 - bar_gap) / 2)
+    readiness_label_colors = {
+        "Ready": GREEN,
+        "Not Ready": RED,
+        "Ready With Conditions": YELLOW,
+        "Unknown": GREY,
+    }
 
     def vbar(x, value, color):
         h = max(0.02, chart_h * safe_div(value, max_bar))
@@ -1825,7 +1906,7 @@ def add_sql_readiness_slide(prs, m):
         label = "Ready w/ Conditions" if cat == "Ready With Conditions" else cat
         label_w = 1.55 if cat == "Ready With Conditions" else group_w
         label_x = gx + (group_w - label_w) / 2
-        add_text(slide, label, label_x, chart_bottom + 0.04, label_w, 0.18, 9, SLATE, True, font="Aptos", align=PP_ALIGN.CENTER)
+        add_text(slide, label, label_x, chart_bottom + 0.04, label_w, 0.18, 9, readiness_label_colors[cat], True, font="Aptos", align=PP_ALIGN.CENTER)
 
     add_source(
         slide,
@@ -1901,25 +1982,27 @@ def build_deck(input_dir: Path, output: Path):
     log(f"  Web apps       : {m['web_total']:,}")
     log("Building slides...")
     prs = new_deck()
-    log("  [1/10] Title")
+    log("  [1/11] Title")
     add_title_slide(prs)
-    log("  [2/10] Consolidated Infrastructure Summary")
+    log("  [2/11] Consolidated Infrastructure Summary")
     add_consolidated_slide(prs, m)
-    log("  [3/10] Fileshare Readiness")
+    log("  [3/11] Fileshare Readiness")
     add_fileshare_readiness_slide(prs, m, output.parent)
-    log("  [4/10] VM Power State Summary")
+    log("  [4/11] VM Power State Summary")
     add_vm_power_slide(prs, m)
-    log("  [5/10] VM Utilization Summary")
+    log("  [5/11] VM Utilization Summary")
     add_vm_utilization_slide(prs, m)
-    log("  [6/10] Fileshares by Host OS Category")
+    log("  [6/11] Fileshares by Host OS Category")
     add_fileshare_os_slide(prs, m)
-    log("  [7/10] Database Resources by Type")
+    log("  [7/11] Database Resources by Type")
     add_db_slide(prs, m)
-    log("  [8/10] Non-SQL Database Readiness")
+    log("  [8/11] Non-SQL Database Readiness")
     add_non_sql_db_readiness_slide(prs, m)
-    log("  [9/10] SQL Readiness")
+    log("  [9/11] SQL Readiness")
     add_sql_readiness_slide(prs, m)
-    log("  [10/10] WebApp Readiness")
+    log("  [10/11] SQL Cost and Licensing")
+    add_sql_cost_licensing_slide(prs, m)
+    log("  [11/11] WebApp Readiness")
     add_webapp_readiness_slide(prs, m, output.parent)
     log("Saving deck...")
     # Write to a local temp file first, validate, then move to the final path.
