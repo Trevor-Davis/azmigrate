@@ -224,6 +224,65 @@ def convert_with_excel(path: Path) -> Path:
     return out
 
 
+def read_sheet_via_excel_com(path: Path, sheet: str) -> pd.DataFrame:
+    """Read a worksheet via Excel COM directly into a DataFrame.
+
+    Works even when the workbook is wrapped in an OLE container (e.g. because
+    of a Microsoft Information Protection sensitivity label) and therefore
+    cannot be read by openpyxl.
+    """
+    try:
+        import win32com.client  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Could not read {path.name} directly and pywin32 is not installed. "
+            "Install it with: python -m pip install pywin32"
+        ) from exc
+
+    excel = win32com.client.DispatchEx("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    wb = None
+    try:
+        wb = excel.Workbooks.Open(str(path), 0, True)
+        try:
+            ws = wb.Worksheets(sheet)
+        except Exception as exc:
+            names = [wb.Worksheets(i + 1).Name for i in range(wb.Worksheets.Count)]
+            raise RuntimeError(
+                f"Sheet '{sheet}' not found in {path.name}. Available: {names}"
+            ) from exc
+        used = ws.UsedRange
+        values = used.Value  # tuple of tuples, or single value if 1 cell
+        if values is None:
+            return pd.DataFrame()
+        if not isinstance(values, tuple):
+            values = ((values,),)
+        if values and not isinstance(values[0], tuple):
+            values = tuple((v,) for v in values)
+    finally:
+        if wb is not None:
+            wb.Close(False)
+        excel.Quit()
+
+    if not values:
+        return pd.DataFrame()
+    header = [("" if v is None else str(v)).strip() for v in values[0]]
+    # de-duplicate empty header slots so pandas doesn't complain
+    seen: dict[str, int] = {}
+    cleaned_header = []
+    for i, h in enumerate(header):
+        name = h if h else f"col_{i}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 0
+        cleaned_header.append(name)
+    rows = [list(r) for r in values[1:]]
+    return pd.DataFrame(rows, columns=cleaned_header)
+
+
 def log(message: str) -> None:
     print(message, flush=True)
 
@@ -362,6 +421,37 @@ def ensure_recommended_memory_openpyxl(lift_path: Path) -> list[str]:
     return blanks
 
 
+def _looks_like_ole_container(path: Path) -> bool:
+    """Return True if the file's magic bytes match the OLE compound-document
+    signature — which typically means the .xlsx is wrapped for MIP/rights
+    management protection and cannot be parsed as a normal Open XML package.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return False
+    return head == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _prompt_reclassify_to_general(path: Path) -> None:
+    log("")
+    log("=" * 78)
+    log(f"  MIP / rights-managed workbook detected: {path.name}")
+    log("  This file has a sensitivity label that wraps it in an OLE container,")
+    log("  so openpyxl / pandas cannot read it as a normal .xlsx.")
+    log("")
+    log("  ACTION REQUIRED:")
+    log(f"    1. Open the file in Excel: {path}")
+    log("    2. On the Home tab, click 'Sensitivity' and change the label to 'General'.")
+    log("    3. Save and close the file.")
+    log("=" * 78)
+    try:
+        input("  Press ENTER once the label has been changed to 'General' (Ctrl+C to abort)... ")
+    except EOFError:
+        pass
+
+
 def ensure_recommended_memory(lift_path: Path) -> None:
     """In Strategy_Lift_and_shift.xlsx, create/refresh:
        - sheet 'Azure SKUs' with [Azure SKU, Memory (GB)] for every SKU in
@@ -373,10 +463,16 @@ def ensure_recommended_memory(lift_path: Path) -> None:
     Excel process is busy.
     """
     log(f"  Updating {lift_path.name}: Azure SKUs sheet + Recommended Memory column")
-    try:
-        blanks = ensure_recommended_memory_openpyxl(lift_path)
-    except zipfile.BadZipFile:
-        log("    WARNING: Workbook is not an Open XML .xlsx package; skipping persisted Azure SKUs update.")
+    if _looks_like_ole_container(lift_path):
+        _prompt_reclassify_to_general(lift_path)
+    for attempt in range(5):
+        try:
+            blanks = ensure_recommended_memory_openpyxl(lift_path)
+            break
+        except zipfile.BadZipFile:
+            _prompt_reclassify_to_general(lift_path)
+    else:
+        log("    WARNING: Workbook is still not an Open XML .xlsx package after prompting.")
         log("    Recommended memory will be derived in memory for this deck run.")
         return
     log("    Azure SKUs sheet + Recommended Memory column updated")
@@ -389,12 +485,21 @@ def ensure_recommended_memory(lift_path: Path) -> None:
 
 def read_excel_any(path: Path, sheet: str) -> pd.DataFrame:
     log(f"  - Reading {path.name} [{sheet}]")
-    try:
-        return read_excel_direct(path, sheet)
-    except Exception:
-        log(f"    direct read failed, converting via Excel automation...")
-        converted = convert_with_excel(path)
-        return pd.read_excel(converted, sheet_name=sheet, engine="openpyxl")
+    for attempt in range(5):
+        if _looks_like_ole_container(path):
+            _prompt_reclassify_to_general(path)
+        try:
+            return read_excel_direct(path, sheet)
+        except zipfile.BadZipFile:
+            log("    Still an OLE-wrapped workbook — sensitivity label not yet changed.")
+            continue
+        except Exception as exc:
+            log(f"    direct read failed ({exc}); trying SaveAs conversion fallback...")
+            converted = convert_with_excel(path)
+            return pd.read_excel(converted, sheet_name=sheet, engine="openpyxl")
+    raise RuntimeError(
+        f"Could not read {path.name} after multiple prompts to remove the MIP label."
+    )
 
 
 def require_columns(df: pd.DataFrame, sheet: str, columns: list[str]) -> None:
@@ -1714,8 +1819,48 @@ def add_sql_cost_licensing_slide(prs, m):
     yearly_savings = yearly_lift - yearly_hybrid  # positive => MI saves money
     savings_color = GREEN if yearly_savings >= 0 else RED
 
-    cost_panel_y = 1.35
-    cost_panel_h = 1.65
+    # --- SQL Server versions owned (above the cost panel) ---
+    versions = m.get("sql_versions") or []
+    # aggregate counts by version label (versions list is (version, status, count))
+    version_totals: dict[str, int] = {}
+    for entry in versions:
+        try:
+            ver, _status, count = entry
+        except (TypeError, ValueError):
+            continue
+        label = str(ver).strip() or "Unknown"
+        try:
+            version_totals[label] = version_totals.get(label, 0) + int(count)
+        except (TypeError, ValueError):
+            continue
+    ordered_versions = sorted(version_totals.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    owned_panel_y = 1.15
+    owned_panel_h = 1.00
+    add_panel(slide, 0.55, owned_panel_y, 12.30, owned_panel_h, "SQL Server versions — quantity owned", title_size=12)
+
+    if not ordered_versions:
+        add_text(slide, "No SQL version data available in Discovery.xlsx.",
+                 0.75, owned_panel_y + 0.45, 12.0, 0.3, 10, MUTED)
+    else:
+        max_chips = 10
+        chips = ordered_versions[:max_chips]
+        gap = 0.12
+        chip_area_w = 12.30 - 0.30
+        chip_w = (chip_area_w - gap * (len(chips) - 1)) / max(len(chips), 1)
+        chip_h = 0.44
+        chip_y = owned_panel_y + 0.45
+        for i, (label, count) in enumerate(chips):
+            x = 0.70 + i * (chip_w + gap)
+            rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(chip_y), Inches(chip_w), Inches(chip_h))
+            rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
+            rect.line.color.rgb = LINE; rect.line.width = Pt(1)
+            add_text(slide, f"{count:,}", x + 0.05, chip_y + 0.02, chip_w - 0.10, 0.22, 14, NAVY, True, align=PP_ALIGN.CENTER)
+            add_text(slide, label,        x + 0.05, chip_y + 0.24, chip_w - 0.10, 0.20, 8,  MUTED, False, align=PP_ALIGN.CENTER)
+
+    # --- Cost comparison cards ---
+    cost_panel_y = owned_panel_y + owned_panel_h + 0.20
+    cost_panel_h = 1.85
     add_panel(slide, 0.55, cost_panel_y, 12.30, cost_panel_h, "Lift & Shift vs SQL MI (where ready) + Lift & Shift remainder", title_size=11)
 
     inner_y = cost_panel_y + 0.50
@@ -1744,48 +1889,6 @@ def add_sql_cost_licensing_slide(prs, m):
               money_full(yearly_savings),
               f"{hybrid_vm_count:,} VMs / {hybrid_mi_count:,} SQL MI   |   {money_full(yearly_savings / 12)}/mo",
               value_color=savings_color)
-
-    lic_y = 3.55
-    lic_h = 2.00
-    add_panel(slide, 0.55, lic_y, 12.30, lic_h, "SQL Server Licensing — owned vs. need", title_size=12)
-
-    licensing_rows = [
-        ("SQL Server Standard",   m.get("sql_std_owned",  18), m.get("sql_std_needed",  24)),
-        ("SQL Server Enterprise", m.get("sql_ent_owned",  12), m.get("sql_ent_needed",  8)),
-    ]
-
-    def licensing_card(x, w, edition, owned, needed):
-        rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(lic_y + 0.40), Inches(w), Inches(lic_h - 0.50))
-        rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
-        rect.line.color.rgb = LINE; rect.line.width = Pt(1)
-
-        try:
-            o = float(owned); n = float(needed)
-            delta_pct = (o - n) / n * 100 if n else 0
-            delta_txt = f"{delta_pct:+.1f}%  {'surplus' if delta_pct >= 0 else 'deficit'}"
-            delta_color = GREEN if delta_pct >= 0 else RED
-            owned_txt = f"{int(o):,}"
-            needed_txt = f"{int(n):,}"
-        except (TypeError, ValueError):
-            delta_txt = "—"
-            delta_color = MUTED
-            owned_txt = str(owned)
-            needed_txt = str(needed)
-
-        add_text(slide, edition, x + 0.22, lic_y + 0.56, w - 0.44, 0.28, 14, NAVY, True)
-        col_w = (w - 0.36) / 3
-        cx = x + 0.22
-        row_y = lic_y + 0.95
-        add_text(slide, "Owned",    cx,                row_y,        col_w, 0.20, 10, MUTED)
-        add_text(slide, owned_txt,  cx,                row_y + 0.24, col_w, 0.30, 18, NAVY, True)
-        add_text(slide, "Need",     cx + col_w,        row_y,        col_w, 0.20, 10, MUTED)
-        add_text(slide, needed_txt, cx + col_w,        row_y + 0.24, col_w, 0.30, 18, NAVY, True)
-        add_text(slide, "Delta",    cx + col_w * 2,    row_y,        col_w, 0.20, 10, MUTED)
-        add_text(slide, delta_txt,  cx + col_w * 2,    row_y + 0.24, col_w, 0.30, 13, delta_color, True)
-
-    card_w = (12.30 - 0.30 - 0.15) / 2
-    licensing_card(0.70,                       card_w, *licensing_rows[0])
-    licensing_card(0.70 + card_w + 0.15,       card_w, *licensing_rows[1])
 
 
 def add_sql_readiness_slide(prs, m):
@@ -1816,36 +1919,41 @@ def add_sql_readiness_slide(prs, m):
     }
     versions_y = 2.05
     versions_h = 4.55
-    add_panel(slide, 0.55, versions_y, 6.4, versions_h, "SQL Server versions by support status", title_size=13)
-    legend_y = versions_y + 0.40
+    add_panel(slide, 0.55, versions_y, 6.4, versions_h, "SQL Server versions by support status", title_size=11)
+    legend_y = versions_y + 0.44
     for i, (label, color) in enumerate([("Mainstream", GREEN), ("Extended", YELLOW), ("Out of support", RED), ("Unknown", GREY)]):
-        x = 0.75 + i * 1.55
-        sw = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(legend_y), Inches(0.16), Inches(0.11))
+        x = 0.75 + i * 1.45
+        sw = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(legend_y), Inches(0.14), Inches(0.10))
         sw.fill.solid(); sw.fill.fore_color.rgb = color; sw.line.fill.background()
-        add_text(slide, label, x + 0.22, legend_y - 0.05, 1.3, 0.22, 10, SLATE, True, font="Aptos")
+        add_text(slide, label, x + 0.20, legend_y - 0.04, 1.2, 0.20, 9, SLATE, True, font="Aptos")
 
     versions = m.get("sql_versions") or []
     if not versions:
         add_text(slide, "No SQL version data available in Discovery.xlsx.", 0.75, versions_y + 0.75, 6.0, 0.3, 10, MUTED)
     else:
         max_count = max(c for *_x, c in versions) or 1
-        rows_top = versions_y + 0.75
-        row_h = min(0.20, (versions_y + versions_h - 0.05 - rows_top) / max(len(versions), 1))
+        rows_top = versions_y + 0.80
+        rows_bottom = versions_y + versions_h - 0.15
+        available_h = rows_bottom - rows_top
+        row_h = available_h / max(len(versions), 1)
         bar_x = 2.30
-        bar_w = 3.55
+        bar_w = 3.05
+        # dynamically size bar and text to fill the row
         for i, (version, status, count) in enumerate(versions):
             y = rows_top + i * row_h
             color = pss_colors.get(status, GREY)
-            add_text(slide, version, 0.7, y, 1.55, row_h - 0.02, 9, SLATE, True)
-            add_bar(slide, bar_x, y + 0.04, bar_w, row_h - 0.10, count, max_count, color)
-            add_text(slide, f"{count:,}", bar_x + bar_w + 0.05, y, 0.85, row_h - 0.02, 9, NAVY, True)
+            label_font = min(11, max(7, int(row_h * 40)))
+            add_text(slide, version, 0.7, y + row_h * 0.15, 1.55, row_h * 0.7, label_font, SLATE, True)
+            bar_thickness = max(0.10, row_h - 0.10)
+            add_bar(slide, bar_x, y + (row_h - bar_thickness) / 2, bar_w, bar_thickness, count, max_count, color)
+            add_text(slide, f"{count:,}", bar_x + bar_w + 0.08, y + row_h * 0.15, 0.95, row_h * 0.7, label_font, NAVY, True)
 
     # SQL Readiness by Target (right) — vertical grouped column chart
     target_y = versions_y
     target_h = versions_h
     panel_x = 7.10
     panel_w = 5.75
-    add_panel(slide, panel_x, target_y, panel_w, target_h, "SQL Readiness by Target", title_size=13)
+    add_panel(slide, panel_x, target_y, panel_w, target_h, "SQL Readiness by Target", title_size=11)
     categories = ["Ready", "Not Ready", "Ready With Conditions", "Unknown"]
     vm_counts = m.get("sql_vm_readiness", {})
     mi_counts = m.get("sql_mi_readiness", {})
