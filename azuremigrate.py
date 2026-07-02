@@ -51,6 +51,7 @@ TEAL = RGBColor(2, 128, 144)
 TEAL_DARK = RGBColor(25, 103, 128)
 MINT = RGBColor(2, 195, 154)
 GREEN = RGBColor(34, 139, 34)
+GREEN_TINT = RGBColor(220, 252, 231)
 RED = RGBColor(220, 38, 38)
 ORANGE = RGBColor(255, 128, 0)
 YELLOW = RGBColor(234, 179, 8)
@@ -1047,23 +1048,10 @@ def load_metrics(input_dir: Path):
                 total += float(pd.to_numeric(df[c], errors="coerce").fillna(0).sum())
         return total
 
-    sql_servers_norm: set[str] = set()
-    for df, col in [(sql_mi_df, "Server"), (sql_vm_df, "SERVER")]:
-        if df is None:
-            continue
-        candidate_col = col if col in df.columns else next(
-            (c for c in df.columns if c.lower() == col.lower()), None
-        )
-        if candidate_col is None:
-            continue
-        for v in df[candidate_col].dropna().astype(str):
-            n = norm_server(v)
-            if n:
-                sql_servers_norm.add(n)
-
     if "server_norm" not in lift.columns:
         lift["server_norm"] = lift["SERVER_NAME"].map(norm_server)
-    sql_lift_only = lift[lift["server_norm"].isin(sql_servers_norm)]
+    sql_lift_servers_norm = set(sql_parent_servers)
+    sql_lift_only = lift[lift["server_norm"].isin(sql_lift_servers_norm)]
     sql_lift_total_cost = float(
         pd.to_numeric(sql_lift_only["TOTAL_MONTHLY_COST_USD"], errors="coerce").fillna(0).sum()
     )
@@ -1161,6 +1149,34 @@ def load_metrics(input_dir: Path):
             rec_mem.loc[missing] = derived_mem
         lift["Recommended Memory"] = rec_mem
     rec_mem_gb = pd.to_numeric(lift["Recommended Memory"], errors="coerce").fillna(0).sum()
+    sql_lift_detail_rows = lift[lift["server_norm"].isin(sql_lift_servers_norm)].copy()
+    sql_lift_onprem_storage_gb = pd.to_numeric(sql_lift_detail_rows["ONPREM_STORAGE_GB"], errors="coerce").fillna(0).sum()
+    sql_lift_rec_storage_gb = pd.to_numeric(sql_lift_detail_rows["RECOMMENDED_STORAGE_SIZE_GB"], errors="coerce").fillna(0).sum()
+    sql_lift_onprem_cores = pd.to_numeric(sql_lift_detail_rows["ONPREM_CORES_COUNT"], errors="coerce").fillna(0).sum()
+    sql_lift_rec_cores = pd.to_numeric(sql_lift_detail_rows["RECOMMENDED_NUMBER_OF_CORES"], errors="coerce").fillna(0).sum()
+    sql_lift_onprem_mem_gb = pd.to_numeric(sql_lift_detail_rows["ONPREM_MEMORY_MB"], errors="coerce").fillna(0).sum() / 1024
+    sql_lift_rec_mem_gb = pd.to_numeric(sql_lift_detail_rows["Recommended Memory"], errors="coerce").fillna(0).sum()
+
+    sql_editions_by_server: dict[str, set[str]] = {}
+    if "edition" in sql_rows.columns:
+        for _, row in sql_rows.iterrows():
+            server = norm_server(row.get("parentResourceName"))
+            edition = str(row.get("edition", "")).strip().lower()
+            if server and edition:
+                sql_editions_by_server.setdefault(server, set()).add(edition)
+
+    sql_lift_cores_by_edition = {"enterprise": 0.0, "standard": 0.0, "developer": 0.0}
+    for _, row in sql_lift_detail_rows.iterrows():
+        server = norm_server(row.get("SERVER_NAME"))
+        editions = sql_editions_by_server.get(server, set())
+        rec_core_count = float(pd.to_numeric(pd.Series([row.get("RECOMMENDED_NUMBER_OF_CORES")]), errors="coerce").fillna(0).iloc[0])
+        if any("developer" in edition for edition in editions):
+            sql_lift_cores_by_edition["developer"] += rec_core_count
+        elif any("enterprise" in edition for edition in editions):
+            sql_lift_cores_by_edition["enterprise"] += rec_core_count
+        elif any("standard" in edition for edition in editions):
+            sql_lift_cores_by_edition["standard"] += rec_core_count
+
     storage_util = pd.to_numeric(lift["STORAGE_UTILIZATION_PERCENT"], errors="coerce").dropna().mean()
     cpu_util = pd.to_numeric(lift["ONPREM_CPU_USAGE_PERCENT"], errors="coerce").dropna().mean()
     mem_util = pd.to_numeric(lift["ONPREM_MEMORY_USAGE_PERCENT"], errors="coerce").dropna().mean()
@@ -1211,6 +1227,18 @@ def load_metrics(input_dir: Path):
         "sql_mi_cost": sql_mi_cost,
         "sql_vm_cost": sql_vm_cost,
         "sql_cost_delta": sql_cost_delta,
+        "sql_lift_details": {
+            "vms": int(sql_lift_detail_rows["server_norm"].dropna().nunique()),
+            "onprem_cores": float(sql_lift_onprem_cores),
+            "rec_cores": float(sql_lift_rec_cores),
+            "onprem_mem_gb": float(sql_lift_onprem_mem_gb),
+            "rec_mem_gb": float(sql_lift_rec_mem_gb),
+            "onprem_storage_gb": float(sql_lift_onprem_storage_gb),
+            "rec_storage_gb": float(sql_lift_rec_storage_gb),
+            "enterprise_cores": float(sql_lift_cores_by_edition["enterprise"]),
+            "standard_cores": float(sql_lift_cores_by_edition["standard"]),
+            "developer_cores": float(sql_lift_cores_by_edition["developer"]),
+        },
         "non_sql_db_total": non_sql_db_total,
         "non_sql_db_counts": non_sql_db_counts,
         "non_sql_db_readiness": non_sql_db_readiness,
@@ -1854,8 +1882,7 @@ def add_sql_cost_licensing_slide(prs, m):
     hybrid_mi_count = int(m.get("sql_mi_total", 0) or 0)
     yearly_lift = lift_cost * 12
     yearly_hybrid = hybrid_cost * 12
-    yearly_savings = yearly_lift - yearly_hybrid  # positive => MI saves money
-    savings_color = GREEN if yearly_savings >= 0 else RED
+    lift_is_lower = lift_cost <= hybrid_cost
 
     # --- SQL Server Licenses & Cores owned (top strip, compact) ---
     licensing = m.get("sql_licensing") or {}
@@ -1889,35 +1916,71 @@ def add_sql_cost_licensing_slide(prs, m):
 
     # --- Cost comparison cards ---
     cost_panel_y = owned_panel_y + owned_panel_h + 0.20
-    cost_panel_h = 1.85
+    cost_panel_h = 3.85
     add_panel(slide, 0.55, cost_panel_y, 12.30, cost_panel_h, "Lift & Shift vs SQL MI (where ready) + Lift & Shift remainder", title_size=11)
 
     inner_y = cost_panel_y + 0.50
-    inner_h = cost_panel_h - 0.65
-    gap = 0.20
-    inner_w = (12.30 - 0.30 - gap * 2) / 3
+    inner_h = cost_panel_h - 0.70
+    gap = 0.25
+    inner_w = (12.30 - 0.30 - gap) / 2
 
-    def cost_card(x, accent, headline, big_value, sub_text, value_color=None):
+    def cost_card(x, accent, headline, big_value, sub_text, highlighted=False, details=None):
         rect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(inner_y), Inches(inner_w), Inches(inner_h))
-        rect.fill.solid(); rect.fill.fore_color.rgb = WHITE
-        rect.line.color.rgb = LINE; rect.line.width = Pt(1)
+        rect.fill.solid(); rect.fill.fore_color.rgb = GREEN_TINT if highlighted else WHITE
+        rect.line.color.rgb = GREEN if highlighted else LINE; rect.line.width = Pt(1.4 if highlighted else 1)
         bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(inner_y), Inches(inner_w), Inches(0.05))
-        bar.fill.solid(); bar.fill.fore_color.rgb = accent; bar.line.fill.background()
+        bar.fill.solid(); bar.fill.fore_color.rgb = GREEN if highlighted else accent; bar.line.fill.background()
         add_text(slide, headline, x + 0.18, inner_y + 0.14, inner_w - 0.36, 0.25, 12, NAVY, True)
-        add_text(slide, big_value, x + 0.18, inner_y + 0.44, inner_w - 0.36, 0.34, 24, value_color or NAVY, True)
+        add_text(slide, big_value, x + 0.18, inner_y + 0.44, inner_w - 0.36, 0.34, 24, GREEN if highlighted else NAVY, True)
         add_text(slide, sub_text, x + 0.18, inner_y + 0.82, inner_w - 0.36, 0.20, 10, MUTED)
+        if details:
+            primary_details = details[:4]
+            edition_details = details[4:]
+            tile_gap = 0.10
+            tile_w = (inner_w - 0.44 - tile_gap) / 2
+            tile_h = 0.46
+            tile_start_y = inner_y + 1.16
+            for i, (label, value) in enumerate(primary_details):
+                tx = x + 0.22 + (i % 2) * (tile_w + tile_gap)
+                ty = tile_start_y + (i // 2) * (tile_h + 0.10)
+                tile = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(tx), Inches(ty), Inches(tile_w), Inches(tile_h))
+                tile.fill.solid(); tile.fill.fore_color.rgb = ALT
+                tile.line.color.rgb = LINE; tile.line.width = Pt(0.7)
+                add_text(slide, label.upper(), tx + 0.08, ty + 0.06, tile_w - 0.16, 0.14, 6.5, MUTED, True)
+                add_text(slide, value, tx + 0.08, ty + 0.22, tile_w - 0.16, 0.18, 9, NAVY, True)
+
+            add_text(slide, "Recommended cores by SQL edition", x + 0.22, inner_y + 2.24, inner_w - 0.44, 0.18, 8, MUTED, True)
+            chip_gap = 0.09
+            chip_w = (inner_w - 0.44 - chip_gap * 2) / 3
+            chip_y = inner_y + 2.48
+            for i, (label, value) in enumerate(edition_details):
+                cx = x + 0.22 + i * (chip_w + chip_gap)
+                chip = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(cx), Inches(chip_y), Inches(chip_w), Inches(0.44))
+                chip.fill.solid(); chip.fill.fore_color.rgb = WHITE
+                chip.line.color.rgb = accent; chip.line.width = Pt(1)
+                add_text(slide, value, cx + 0.05, chip_y + 0.06, chip_w - 0.10, 0.16, 10, NAVY, True, align=PP_ALIGN.CENTER)
+                add_text(slide, label.replace(" cores", ""), cx + 0.05, chip_y + 0.24, chip_w - 0.10, 0.14, 6.5, MUTED, True, align=PP_ALIGN.CENTER)
 
     x0 = 0.70
+    lift_details = m.get("sql_lift_details") or {}
+    lift_detail_lines = [
+        ("Number of VMs", f"{lift_details.get('vms', lift_vm_count):,}"),
+        ("Cores vs on-prem", f"{lift_details.get('rec_cores', 0):,.0f} vs {lift_details.get('onprem_cores', 0):,.0f}"),
+        ("Memory vs on-prem", f"{tb_from_gib(lift_details.get('rec_mem_gb', 0))} vs {tb_from_gib(lift_details.get('onprem_mem_gb', 0))}"),
+        ("Storage vs on-prem", f"{tb_from_gb(lift_details.get('rec_storage_gb', 0))} vs {tb_from_gb(lift_details.get('onprem_storage_gb', 0))}"),
+        ("Enterprise cores", f"{lift_details.get('enterprise_cores', 0):,.0f}"),
+        ("Standard cores", f"{lift_details.get('standard_cores', 0):,.0f}"),
+        ("Developer cores", f"{lift_details.get('developer_cores', 0):,.0f}"),
+    ]
     cost_card(x0, RED, "100% Lift & Shift",
               money_k(lift_cost),
-              f"{lift_vm_count:,} VMs / 0 SQL MI   |   {money_full(yearly_lift)}/yr")
+              f"{lift_vm_count:,} VMs / 0 SQL MI   |   {money_full(yearly_lift)}/yr",
+              highlighted=lift_is_lower,
+              details=lift_detail_lines)
     cost_card(x0 + inner_w + gap, TEAL, "SQL MI (where ready) + Lift & Shift",
               money_k(hybrid_cost),
-              f"{hybrid_vm_count:,} VMs / {hybrid_mi_count:,} SQL MI   |   {money_full(yearly_hybrid)}/yr")
-    cost_card(x0 + (inner_w + gap) * 2, savings_color, "Yearly Savings Using SQL MI",
-              money_full(yearly_savings),
-              f"{hybrid_vm_count:,} VMs / {hybrid_mi_count:,} SQL MI   |   {money_full(yearly_savings / 12)}/mo",
-              value_color=savings_color)
+              f"{hybrid_vm_count:,} VMs / {hybrid_mi_count:,} SQL MI   |   {money_full(yearly_hybrid)}/yr",
+              highlighted=not lift_is_lower)
 
 
 def add_sql_readiness_slide(prs, m):
