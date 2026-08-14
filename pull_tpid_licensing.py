@@ -144,6 +144,65 @@ def edge_processes_running() -> bool:
         return False
 
 
+def confirm_close_all_edge() -> bool:
+    """Shows a native OK/Cancel dialog asking whether to close all running
+    Microsoft Edge processes before launching the automation browser.
+    Returns True if the user clicked OK, False if Cancel/dismissed.
+
+    Closing Edge first is recommended: repeated or interrupted runs of this
+    script can leave stray/zombie msedge.exe processes behind, which have
+    been observed to cause resource contention and, in some cases,
+    contribute to unstable/looping page loads."""
+
+    if not edge_processes_running():
+        return False  # nothing to close
+
+    MB_OKCANCEL = 0x00000001
+    MB_ICONWARNING = 0x00000030
+    IDOK = 1
+
+    try:
+        import ctypes
+        result = ctypes.windll.user32.MessageBoxW(
+            0,
+            "Microsoft Edge appears to be running.\n\n"
+            "Closing ALL Edge windows/processes first is recommended before "
+            "this script launches its own automated Edge session - this avoids "
+            "leftover processes from prior runs causing instability.\n\n"
+            "Click OK to close all Edge processes now, or Cancel to leave "
+            "them running and continue anyway.",
+            "pull_tpid_licensing.py",
+            MB_OKCANCEL | MB_ICONWARNING,
+        )
+        return result == IDOK
+    except Exception:  # noqa: BLE001
+        # Fall back to a console prompt if the native dialog can't be shown
+        # (e.g. no GUI session available).
+        answer = input(
+            "Microsoft Edge appears to be running. Close all Edge processes "
+            "before continuing? [Y/n]: "
+        ).strip().lower()
+        return answer in ("", "y", "yes")
+
+
+def close_all_edge_processes() -> None:
+    """Force-closes every running msedge.exe process."""
+    log("Closing all Microsoft Edge processes...")
+    try:
+        subprocess.run(
+            ["taskkill", "/IM", "msedge.exe", "/F"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"  WARNING: could not close Edge processes automatically: {exc}")
+        return
+    time.sleep(2)
+    if edge_processes_running():
+        log("  Some Edge processes may still be shutting down.")
+    else:
+        log("  All Edge processes closed.")
+
+
 def refresh_profile_copy() -> None:
     """Re-copies the real, live Edge profile into REAL_PROFILE_COPY_DIR, so
     the automation profile picks up your current sign-in session. Edge must
@@ -403,6 +462,12 @@ def main() -> None:
              "this script (picks up a fresh sign-in session). Requires closing Edge "
              "temporarily. Run this alone, without --tpid, then re-run normally.",
     )
+    parser.add_argument(
+        "--no-edge-check",
+        action="store_true",
+        help="Skip the startup prompt that offers to close all running Edge processes. "
+             "Use for unattended/scripted runs.",
+    )
     args = parser.parse_args()
 
     if args.refresh_profile:
@@ -411,6 +476,13 @@ def main() -> None:
 
     if not args.tpid:
         parser.error("--tpid is required (unless using --refresh-profile).")
+
+    if not args.no_edge_check and not args.headless:
+        if edge_processes_running():
+            if confirm_close_all_edge():
+                close_all_edge_processes()
+            else:
+                log("Continuing with Edge left running (user chose Cancel).")
 
     out_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_ROOT / f"{args.tpid}_Licensing_{time.strftime('%Y%m%d')}"
     out_dir.mkdir(parents=True, exist_ok=True)
