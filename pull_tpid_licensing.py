@@ -28,15 +28,11 @@ Playwright's bundled Chromium outright ("You can't get there from here -
 devices/client apps must meet Microsoft management compliance policy").
 Specifically the script:
 
-  1. Launches Microsoft Edge using a COPY of YOUR REAL, already-signed-in
-     Edge profile (not a fresh/blank automation profile, and not your live
-     profile directly - see "REFRESHING YOUR SIGN-IN" below for why it's a
-     copy). This matters: a brand-new, never-used Edge profile driving a
-     sensitive-data export appears to get killed mid-download by an
-     endpoint security control (most likely Microsoft Defender for Cloud
-     Apps / device-compliance enforcement, given the confidential label on
-     this report). The profile copy carries your real, already-authenticated,
-     trusted session, so it does not hit that wall.
+  1. Launches Microsoft Edge using a DEDICATED automation profile (separate
+     from your everyday Edge profile - see "SIGN-IN AND SESSION" below).
+     Sign in once here; the session then renews itself automatically on
+     normal use, the same way any browser profile's Azure AD refresh token
+     rotates - no manual "refresh" step is needed going forward.
   2. Opens the report's "Account and Pricing" page and sets the "Customer
      TPID (Required)" slicer to the TPID you provide.
   3. Switches to the "Customer Entitlements" page (Licensing Details view).
@@ -50,10 +46,19 @@ Specifically the script:
      (via the download's suggested filename), so tables are never
      mis-identified or mixed up.
 
-IMPORTANT: this script automates a COPY of your real Edge profile (see
-"REFRESHING YOUR SIGN-IN" below), not your live profile directly - so your
-everyday Edge windows can stay open while this script runs. Edge only needs
-to be closed when you explicitly run --refresh-profile to update that copy.
+SIGN-IN AND SESSION
+--------------------
+The FIRST time you run this script (or after --use-profile-copy has never
+been used), a visible Edge window opens using a dedicated profile at
+~/.pbi_tpid_export_profile. If it's not already signed in, complete the
+Microsoft sign-in there once. After that, this profile's own session stays
+valid on its own for routine use - it is a real, live browser profile, not
+a static snapshot, so it doesn't go stale the way a one-time copy would.
+
+At startup, if Microsoft Edge is currently running, you'll be asked (OK/
+Cancel) whether to close all Edge windows first - recommended, since stray
+processes from prior interrupted runs can cause instability. This does NOT
+affect the dedicated automation profile's saved session either way.
 
 FIRST-TIME SETUP
 -----------------
@@ -65,22 +70,22 @@ USAGE
 -----
     .venv\\Scripts\\python pull_tpid_licensing.py --tpid 1103880
     .venv\\Scripts\\python pull_tpid_licensing.py --tpid 1103880 --output-dir "C:\\path\\to\\folder"
-    .venv\\Scripts\\python pull_tpid_licensing.py --tpid 1103880 --isolated-profile
 
-REFRESHING YOUR SIGN-IN (if your session ever expires)
---------------------------------------------------------
-The script uses a one-time COPY of your real Edge profile so it can carry
-your existing sign-in without Chromium's "non-default data directory"
-restriction. If that copied session eventually expires (you start getting
-prompted to sign in again, or TPID search stops finding matches), refresh
-it with:
+ADVANCED: USING A COPY OF YOUR REAL EDGE PROFILE INSTEAD
+-----------------------------------------------------------
+Pass --use-profile-copy to instead use a one-time COPY of your real,
+already-signed-in Edge profile. This is NOT the default and generally NOT
+recommended for routine use: it's a static snapshot that eventually goes
+stale (you'll see repeated sign-in redirect timeouts) and must be manually
+refreshed with:
 
     .venv\\Scripts\\python pull_tpid_licensing.py --refresh-profile
 
-This will ask you to close all Edge windows (needed so the real profile
-isn't locked while it's copied), then re-copy your current real profile -
-picking up whatever fresh sign-in session is active in your everyday Edge -
-into the automation copy used by this script.
+which asks you to close all Edge windows (needed so your real profile isn't
+locked while it's copied), then re-copies your current real profile into
+the automation copy. Prefer the default dedicated profile instead unless
+you have a specific reason to need your real profile's exact browsing
+state/extensions.
 
 If the TPID search matches more than one account, the script lists the
 matches and asks you to re-run with a more specific TPID (or the full
@@ -122,8 +127,11 @@ REAL_EDGE_SOURCE_DIR = Path.home() / "AppData" / "Local" / "Microsoft" / "Edge" 
 REAL_PROFILE_COPY_DIR = Path.home() / ".pbi_tpid_export_profile_realcopy"
 REAL_EDGE_PROFILE_NAME = "Default"
 
-# Fallback isolated profile (used only with --isolated-profile).
-ISOLATED_PROFILE_DIR = Path.home() / ".pbi_tpid_export_profile"
+# Default: a dedicated automation profile, separate from your everyday
+# Edge. Sign in once here and its own session/refresh tokens renew
+# automatically on normal use - it does NOT go stale the way a one-time
+# copy of your real profile does (see --refresh-profile / --use-profile-copy).
+DEDICATED_PROFILE_DIR = Path.home() / ".pbi_tpid_export_profile"
 
 DEFAULT_OUTPUT_ROOT = Path.cwd()
 
@@ -450,10 +458,14 @@ def main() -> None:
     parser.add_argument("--output-dir", help="Folder to save exported .xlsx files into. Defaults to <current directory>/<TPID>_Licensing_<date>/")
     parser.add_argument("--headless", action="store_true", help="Run browser headless (use only after first successful sign-in).")
     parser.add_argument(
-        "--isolated-profile",
+        "--use-profile-copy",
         action="store_true",
-        help="Use a separate automation profile instead of your real Edge profile. "
-             "Slower to sign in and more likely to hit compliance/DLP restrictions on export.",
+        help="Use a one-time COPY of your real, signed-in Edge profile instead of the "
+             "default dedicated automation profile. NOT recommended for routine use: the "
+             "copy is a static snapshot whose sign-in session eventually goes stale and "
+             "requires --refresh-profile to fix, whereas the default dedicated profile "
+             "renews its own session automatically the normal way (Azure AD refresh "
+             "tokens rotate on each use).",
     )
     parser.add_argument(
         "--refresh-profile",
@@ -487,7 +499,7 @@ def main() -> None:
     out_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_ROOT / f"{args.tpid}_Licensing_{time.strftime('%Y%m%d')}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    use_real_profile = not args.isolated_profile
+    use_real_profile = args.use_profile_copy
 
     with sync_playwright() as p:
         if use_real_profile:
@@ -508,10 +520,11 @@ def main() -> None:
                 args=[f"--profile-directory={REAL_EDGE_PROFILE_NAME}"],
             )
         else:
-            log("Launching Microsoft Edge using an isolated automation profile...")
-            ISOLATED_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            log("Launching Microsoft Edge using the dedicated automation profile...")
+            log(f"  Profile dir: {DEDICATED_PROFILE_DIR}")
+            DEDICATED_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
             context = p.chromium.launch_persistent_context(
-                user_data_dir=str(ISOLATED_PROFILE_DIR),
+                user_data_dir=str(DEDICATED_PROFILE_DIR),
                 channel="msedge",
                 headless=args.headless,
                 accept_downloads=True,
