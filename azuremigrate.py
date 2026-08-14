@@ -1174,7 +1174,11 @@ def load_metrics(input_dir: Path):
             sql_lift_cores_by_edition["developer"] += rec_core_count
         elif any("enterprise" in edition for edition in editions):
             sql_lift_cores_by_edition["enterprise"] += rec_core_count
-        elif any("standard" in edition for edition in editions):
+        else:
+            # Standard is the default assumption when the edition is missing,
+            # blank, or doesn't recognizably match Developer/Enterprise, so
+            # Enterprise + Standard + Developer always reconciles to the
+            # same "Cores vs on-prem" total shown elsewhere on this slide.
             sql_lift_cores_by_edition["standard"] += rec_core_count
 
     storage_util = pd.to_numeric(lift["STORAGE_UTILIZATION_PERCENT"], errors="coerce").dropna().mean()
