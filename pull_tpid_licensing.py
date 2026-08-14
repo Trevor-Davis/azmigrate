@@ -529,6 +529,7 @@ def main() -> None:
                 headless=args.headless,
                 accept_downloads=True,
                 viewport={"width": 1600, "height": 1000},
+                chromium_sandbox=True,
             )
 
         page = context.pages[0] if context.pages else context.new_page()
